@@ -760,6 +760,8 @@ int MqttDecode_ConnectAck(byte *rx_buf, int rx_buf_len,
 #endif
     }
 
+    (void)rx_payload;
+
     /* Return total length of packet */
     return header_len + remain_len;
 }
@@ -954,7 +956,6 @@ int MqttEncode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
 
     /* Encode variable header */
     tx_payload += MqttEncode_Num(&tx_buf[header_len], publish_resp->packet_id);
-    (void)tx_payload;
 
 #ifdef WOLFMQTT_V5
     if ((publish_resp->reason_code != MQTT_REASON_SUCCESS) ||
@@ -971,6 +972,8 @@ int MqttEncode_PublishResp(byte* tx_buf, int tx_buf_len, byte type,
                         publish_resp->props, tx_payload);
     }
 #endif
+
+    (void)tx_payload;
 
     /* Return total length of packet */
     return header_len + remain_len;
@@ -1332,6 +1335,8 @@ int MqttEncode_Disconnect(byte *tx_buf, int tx_buf_len,
         /* Encode properties */
         tx_payload += MqttEncode_Props(MQTT_PACKET_TYPE_CONNECT,
                         disconnect->props, tx_payload);
+
+        (void)tx_payload;
     }
 #else
     (void)disconnect;
@@ -1375,6 +1380,9 @@ int MqttDecode_Disconnect(byte *rx_buf, int rx_buf_len, MqttDisconnect *disc)
             }
         }
     }
+
+    (void)rx_payload;
+
     /* Return total length of packet */
     return header_len + remain_len;
 }
@@ -1426,6 +1434,7 @@ int MqttEncode_Auth(byte *tx_buf, int tx_buf_len, MqttAuth *auth)
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }
 
+    (void)tx_payload;
 
     /* Return total length of packet */
     return header_len + remain_len;
@@ -1484,6 +1493,8 @@ int MqttDecode_Auth(byte *rx_buf, int rx_buf_len, MqttAuth *auth)
     else {
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }
+
+    (void)rx_payload;
 
     /* Return total length of packet */
     return header_len + remain_len;
