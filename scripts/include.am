@@ -9,8 +9,9 @@ dist_noinst_SCRIPTS += scripts/client.test \
                        scripts/awsiot.test \
                        scripts/wiot.test \
                        scripts/nbclient.test
-if BUILD_MULTITHREAD
-dist_noinst_SCRIPTS += scripts/multithread.test
-endif
+# DISABLED UNTIL SCRIPT ISSUE IS RESOLVED
+#if BUILD_MULTITHREAD
+#dist_noinst_SCRIPTS += scripts/multithread.test
+#endif
 
 endif
