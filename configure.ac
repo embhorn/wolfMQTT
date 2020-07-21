@@ -252,6 +252,43 @@ fi
 
 AM_CONDITIONAL([BUILD_MULTITHREAD], [test "x$ENABLED_MULTITHREAD" = "xyes"])
 
+# PikeOS support
+ENABLED_PIKEOS="no"
+trypikeosdir=""
+AC_ARG_WITH([pikeos],
+    [AS_HELP_STRING([--with-pikeos=PATH],[PATH to PikeOS install (default /opt/pikeos-5.0/)])],
+
+    [
+        AC_MSG_CHECKING([for PikeOS])
+
+        if test "x$withval" != "xno" ; then
+            trypikeosdir=$withval
+        fi
+        if test "x$withval" = "xyes" ; then
+            trypikeosdir="/opt/pikeos-5.0"
+        fi
+
+        AC_CHECK_PROG([pikeosfound], ["pikeos-version"], [yes], [no], [$trypikeosdir/bin])
+
+        if test "x$pikeosfound" = "xno" ; then
+            AC_MSG_ERROR([pikeos-version isn't found.
+            If it's already installed, specify its path using --with-pikeos=/dir/])
+        fi
+
+        enable_shared=no
+        enable_static=yes
+
+        ENABLED_PIKEOS=yes
+        AC_MSG_RESULT([yes])
+    ],
+    [ ENABLED_PIKEOS=no ]
+)
+
+if test "$ENABLED_PIKEOS" = "yes"
+then
+    AM_CFLAGS="$AM_CFLAGS -DHAVE_PIKEOS"
+fi
+
 # HARDEN FLAGS
 AX_HARDEN_CC_COMPILER_FLAGS
 

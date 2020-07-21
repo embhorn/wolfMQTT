@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="us-ascii" standalone="no"?>
+<Option xmlns="http://www.sysgo.com/xsd/prj/option-4.3.xsd" name="WolfMQTT">
+  <Description>
+    <p>Enables use of the WolfMQTT API with WolfSSL LWIP stack.<br/>
+    The WolfMQTT option requires WolfSSL option stack options
+    .</p>
+    <p/>
+    <p>Refer to the
+    <a href="documentation/posix/posix-lwip.pdf">
+    TCP/IP for PikeOS POSIX</a>
+    manual for further details.</p>     
+  </Description>
+  <Condition condition="($(POSIX_WOLFSSL)==true)">
+    <Parameter desc="Enable WolfMQTT support" display="WolfMQTT" name="POSIX_WOLFMQTT" type="boolean" value="false"/>
+  </Condition>
+</Option>

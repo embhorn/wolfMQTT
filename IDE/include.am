@@ -4,3 +4,4 @@
 
 include IDE/ARDUINO/include.am
 include IDE/Microchip-Harmony/include.am
+include IDE/PIKEOS/include.am
