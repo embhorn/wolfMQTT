@@ -2822,6 +2822,7 @@ int SN_Client_Register(MqttClient *client, SN_Register *regist)
 int SN_Client_Ping(MqttClient *client, SN_PingReq *ping)
 {
     int rc, len;
+    SN_PingReq loc_ping;
 
     /* Validate required arguments */
     if (client == NULL) {
@@ -2829,8 +2830,9 @@ int SN_Client_Ping(MqttClient *client, SN_PingReq *ping)
     }
 
     if (ping == NULL) {
-        /* use client global */
-        ping = &client->msgSN.pingReq;
+        /* use local structure */
+        ping = &loc_ping;
+        XMEMSET(ping, 0, sizeof(SN_PingReq));
     }
 
     if (ping->stat == MQTT_MSG_BEGIN) {
