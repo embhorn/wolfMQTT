@@ -261,6 +261,7 @@ AC_ARG_WITH([pikeos],
     [
         AC_MSG_CHECKING([for PikeOS])
 
+
         if test "x$withval" != "xno" ; then
             trypikeosdir=$withval
         fi
@@ -277,7 +278,7 @@ AC_ARG_WITH([pikeos],
 
         enable_shared=no
         enable_static=yes
-
+    
         ENABLED_PIKEOS=yes
         AC_MSG_RESULT([yes])
     ],
@@ -286,7 +287,25 @@ AC_ARG_WITH([pikeos],
 
 if test "$ENABLED_PIKEOS" = "yes"
 then
-    AM_CFLAGS="$AM_CFLAGS -DHAVE_PIKEOS"
+    AM_CFLAGS="$AM_CFLAGS -DWOLFSSL_PIKEOS -DWOLFSSL_LWIP"
+    
+    if test "$host_cpu" = "x86_64"
+    then
+        AM_CFLAGS="$AM_CFLAGS -I$trypikeosdir/target/x86/amd64/posix/include \
+                    -I$trypikeosdir/target/x86/amd64/posix/lwip/include \
+                    -I$trypikeosdir/target/x86/amd64/posix/lwip/include/opts \
+                    -I$trypikeosdir/target/x86/amd64/driver/include \
+                    -I$trypikeosdir/target/x86/amd64/include"
+    fi
+    
+    if test "$host_cpu" = "aarch64"
+    then
+        AM_CFLAGS="$AM_CFLAGS -I$trypikeosdir/target/arm/v8hf/posix/include \
+                    -I$trypikeosdir/target/arm/v8hf/posix/lwip/include \
+                    -I$trypikeosdir/target/arm/v8hf/posix/lwip/include/opts \
+                    -I$trypikeosdir/target/arm/v8hf/driver/include \
+                    -I$trypikeosdir/target/arm/v8hf/include"
+    fi
 fi
 
 # HARDEN FLAGS
