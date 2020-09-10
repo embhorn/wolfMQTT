@@ -254,7 +254,7 @@ enum MqttPacketFlags {
 
 /* Packet Header: Size is variable 2 - 5 bytes */
 #define MQTT_PACKET_MAX_LEN_BYTES   4
-#define MQTT_PACKET_LEN_ENCODE_MASK 0x80
+#define MQTT_PACKET_LEN_ENCODE_MASK 0x80L
 typedef struct _MqttPacket {
     /* Type = bits 4-7, Flags = 0-3 are flags */
     byte        type_flags; /* MqttPacketType and MqttPacketFlags */

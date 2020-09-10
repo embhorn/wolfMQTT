@@ -217,7 +217,7 @@ static int MqttDecode_FixedHeader(byte *rx_buf, int rx_buf_len, int *remain_len,
 int MqttDecode_Vbi(byte *buf, word32 *value)
 {
     int rc = 0;
-    int multiplier = 1;
+    word32 multiplier = 1;
     byte encodedByte;
 
     *value = 0;
