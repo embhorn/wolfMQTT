@@ -913,12 +913,24 @@ int MqttDecode_Publish(byte *rx_buf, int rx_buf_len, MqttPublish *publish)
     /* Decode variable header */
     variable_len = MqttDecode_String(rx_payload, &publish->topic_name,
         &publish->topic_name_len);
-    rx_payload += variable_len;
+    if (variable_len + header_len <= rx_buf_len) {
+        rx_payload += variable_len;
+    }
+    else {
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
 
     /* If QoS > 0 then get packet Id */
     if (publish->qos > MQTT_QOS_0) {
+        if (rx_payload - rx_buf + MQTT_DATA_LEN_SIZE > rx_buf_len)
+            return MQTT_CODE_ERROR_OUT_OF_BUFFER;
         variable_len += MqttDecode_Num(rx_payload, &publish->packet_id);
-        rx_payload += MQTT_DATA_LEN_SIZE;
+        if (variable_len + header_len <= rx_buf_len) {
+            rx_payload += MQTT_DATA_LEN_SIZE;
+        }
+        else {
+            return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+        }
     }
 
 #ifdef WOLFMQTT_V5
@@ -928,15 +940,20 @@ int MqttDecode_Publish(byte *rx_buf, int rx_buf_len, MqttPublish *publish)
 
         /* Decode Length of Properties */
         tmp = MqttDecode_Vbi(rx_payload, &props_len);
-        rx_payload += tmp;
         variable_len += tmp + props_len;
-        if (props_len > 0) {
-            /* Decode the Properties */
-            rx_payload += MqttDecode_Props((MqttPacketType)publish->type, 
-                &publish->props, rx_payload, props_len);
-            if (publish->props != NULL) {
-                /* Parse properties. */
+        if (variable_len + header_len <= rx_buf_len) {
+            rx_payload += tmp;
+            if (props_len > 0) {
+                /* Decode the Properties */
+                rx_payload += MqttDecode_Props((MqttPacketType)publish->type,
+                    &publish->props, rx_payload, props_len);
+                if (publish->props != NULL) {
+                    /* Parse properties. */
+                }
             }
+        }
+        else {
+            return MQTT_CODE_ERROR_OUT_OF_BUFFER;
         }
     }
 #endif
