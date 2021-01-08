@@ -3885,6 +3885,8 @@ int SN_Client_Disconnect_ex(MqttClient *client, SN_Disconnect *disconnect)
         return rc;
     }
 
+    rc = MQTT_CODE_SUCCESS;
+
     /* If sleep was set, wait for response disconnect packet */
     if ((disconnect != NULL) && (disconnect->sleepTmr != 0)) {
         rc = SN_Client_WaitType(client, NULL,
@@ -3903,7 +3905,7 @@ int SN_Client_Disconnect_ex(MqttClient *client, SN_Disconnect *disconnect)
     #endif
     }
 
-    return MQTT_CODE_SUCCESS;
+    return rc;
 }
 
 int SN_Client_WaitMessage_ex(MqttClient *client, SN_Object* packet_obj, int timeout_ms)
