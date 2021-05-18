@@ -74,7 +74,8 @@
     #define SOCK_RECV(s,b,l,f) recv((s), (char*)(b), (size_t)(l), (f))
     #define GET_SOCK_ERROR(f,s,o,e) (e) = WSAGetLastError()
     #define SOCK_EQ_ERROR(e) (((e) == WSAEWOULDBLOCK) || ((e) == WSAEINPROGRESS))
-
+    #define MSG_DONTWAIT 0
+    #define MSG_NOSIGNAL 0
 /* Freescale MQX / RTCS */
 #elif defined(FREESCALE_MQX) || defined(FREESCALE_KSDK_MQX)
     #if defined(FREESCALE_MQX)
@@ -814,7 +815,7 @@ static int NetWrite(void *context, const byte* buf, int buf_len,
     setsockopt(sock->fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv));
 #endif
 
-    rc = (int)SOCK_SEND(sock->fd, buf, buf_len, 0);
+    rc = (int)SOCK_SEND(sock->fd, buf, buf_len, (MSG_DONTWAIT | MSG_NOSIGNAL));
     if (rc == -1) {
         /* Get error */
         GET_SOCK_ERROR(sock->fd, SOL_SOCKET, SO_ERROR, so_error);
