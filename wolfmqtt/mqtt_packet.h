@@ -710,6 +710,7 @@ WOLFMQTT_LOCAL int MqttProps_Init(void);
 WOLFMQTT_LOCAL int MqttProps_ShutDown(void);
 WOLFMQTT_LOCAL MqttProp* MqttProps_Add(MqttProp **head);
 WOLFMQTT_LOCAL int MqttProps_Free(MqttProp *head);
+WOLFMQTT_LOCAL int MqttProps_Status(void);
 WOLFMQTT_LOCAL MqttProp* MqttProps_FindType(MqttProp *head,
     MqttPropertyType type);
 #endif

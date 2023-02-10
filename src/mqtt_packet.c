@@ -1882,6 +1882,31 @@ int MqttProps_Free(MqttProp *head)
     return ret;
 }
 
+/* Check property stack usage */
+int MqttProps_Status(void)
+{
+    int ret = 0;
+    int i;
+
+#ifdef WOLFMQTT_MULTITHREAD
+    if ((ret = wm_SemLock(&clientPropStack_lock)) != 0) {
+        return ret;
+    }
+#endif
+
+    for (i = 0; i < MQTT_MAX_PROPS; i++) {
+        if (clientPropStack[i].type == MQTT_PROP_NONE) {
+            ret++;
+        }
+    }
+
+#ifdef WOLFMQTT_MULTITHREAD
+    (void)wm_SemUnlock(&clientPropStack_lock);
+#endif
+
+    return ret;
+}
+
 #endif /* WOLFMQTT_V5 */
 
 static int MqttPacket_HandleNetError(MqttClient *client, int rc)

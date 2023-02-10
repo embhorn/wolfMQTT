@@ -496,6 +496,7 @@ int mqttclient_test(MQTTCtx *mqttCtx)
             prop->type = MQTT_PROP_TOPIC_ALIAS;
             prop->data_short = mqttCtx->topic_alias;
         }
+        PRINTF("Number of free properties: %d", MqttClient_PropsStatus());
     #endif
 
         /* This loop allows payloads larger than the buffer to be sent by
@@ -525,6 +526,7 @@ int mqttclient_test(MQTTCtx *mqttCtx)
             /* Release the allocated properties */
             MqttClient_PropsFree(mqttCtx->publish.props);
         }
+        PRINTF("Number of free properties: %d", MqttClient_PropsStatus());
     #endif
     }
 

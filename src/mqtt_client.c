@@ -2464,6 +2464,10 @@ int MqttClient_PropsFree(MqttProp *head)
     return MqttProps_Free(head);
 }
 
+int MqttClient_PropsStatus(void)
+{
+    return MqttProps_Status();
+}
 #endif /* WOLFMQTT_V5 */
 
 int MqttClient_WaitMessage_ex(MqttClient *client, MqttObject* msg,

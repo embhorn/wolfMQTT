@@ -410,6 +410,7 @@ WOLFMQTT_API int MqttClient_Auth(
 /*! \brief      Add a new property.
  *  Allocate a property structure and add it to the head of the list
     pointed to by head. To be used prior to calling packet command.
+    Call MqttClient_PropsFree to free elements after packet command is complete.
  *  \param      head        Pointer-pointer to a property structure
  *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_BAD_ARG
  */
@@ -420,12 +421,18 @@ WOLFMQTT_API MqttProp* MqttClient_PropsAdd(
  *  Deallocate the list pointed to by head. Must be used after the
                 packet command that used MqttClient_Prop_Add.
  *  \param      head        Pointer-pointer to a property structure
- *  \return     MQTT_CODE_SUCCESS or -1 on error (and sets errno)
+ *  \return     MQTT_CODE_SUCCESS or negative on error (and sets errno)
  */
 WOLFMQTT_API int MqttClient_PropsFree(
     MqttProp *head);
-#endif
 
+/*! \brief      Get number of free elements in property stack.
+ *  \param      None
+ *  \return     Number of free elements or negative on error (and sets errno)
+ */
+WOLFMQTT_API int MqttClient_PropsStatus(
+    void);
+#endif
 
 /*! \brief      Encodes and sends the MQTT Disconnect packet (no response)
  *  \note This is a non-blocking function that will try and send using
