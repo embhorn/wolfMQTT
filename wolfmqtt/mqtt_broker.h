@@ -641,6 +641,15 @@ typedef struct BrokerClient {
     int                qos2_pending_count;
 #endif
 #endif /* WOLFMQTT_MAX_QOS >= 2 */
+#ifdef WOLFMQTT_STATIC_MEMORY
+    /* Outbound QoS 1/2 Packet Identifiers sent to this client and not yet
+     * released by its PUBACK or PUBCOMP. [MQTT-2.3.1-4] applies the Client
+     * identifier rule to a Server sending a QoS > 0 PUBLISH, so a new one
+     * must not reuse an identifier still awaiting acknowledgement. Slot value
+     * 0 is empty. Dynamic-memory builds derive this from the per-subscriber
+     * out_q instead, via BrokerNextPacketIdForQueue. */
+    word16  out_inflight[BROKER_MAX_INFLIGHT_PER_SUB];
+#endif
 #ifndef WOLFMQTT_STATIC_MEMORY
     /* Per-subscriber outbound publish queue. FIFO from head to tail;
      * drain pulls from head. out_q_inflight is the number of entries in

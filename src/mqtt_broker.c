@@ -4397,6 +4397,79 @@ static word16 BrokerNextPacketId(MqttBroker* broker)
     }
     return id;
 }
+
+/* Outbound Packet Identifier occupancy for the static-memory fan-out, which
+ * has no per-subscriber queue to derive it from. [MQTT-2.3.1-4] holds a Server
+ * sending a QoS > 0 PUBLISH to the same rule as a Client: the identifier stays
+ * in use until the matching PUBACK (QoS 1) or PUBCOMP (QoS 2) is processed. */
+static int BrokerStaticOutId_InUse(const BrokerClient* bc, word16 packet_id)
+{
+    int i;
+
+    for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
+        if (bc->out_inflight[i] == packet_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void BrokerStaticOutId_Release(BrokerClient* bc, word16 packet_id)
+{
+    int i;
+
+    if (bc == NULL || packet_id == 0) {
+        return;
+    }
+    for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
+        if (bc->out_inflight[i] == packet_id) {
+            bc->out_inflight[i] = 0;
+            return;
+        }
+    }
+}
+
+/* Pick an identifier this subscriber is not already waiting on and record it.
+ * Returns 0 when every value is outstanding or the table is full, which the
+ * callers treat as "cannot deliver this QoS > 0 PUBLISH now" rather than
+ * reusing an identifier the client has not acknowledged. */
+static word16 BrokerStaticOutId_Take(MqttBroker* broker, BrokerClient* bc)
+{
+    word16 candidate;
+    word16 first;
+    int i;
+
+    for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
+        if (bc->out_inflight[i] == 0) {
+            break;
+        }
+    }
+    if (i == BROKER_MAX_INFLIGHT_PER_SUB) {
+        return 0; /* every in-flight slot is taken */
+    }
+
+    candidate = broker->next_packet_id;
+    if (candidate == 0) {
+        candidate = 1;
+    }
+    first = candidate;
+    do {
+        if (!BrokerStaticOutId_InUse(bc, candidate)) {
+            broker->next_packet_id = (word16)(candidate + 1);
+            if (broker->next_packet_id == 0) {
+                broker->next_packet_id = 1;
+            }
+            bc->out_inflight[i] = candidate;
+            return candidate;
+        }
+        candidate++;
+        if (candidate == 0) {
+            candidate = 1;
+        }
+    } while (candidate != first);
+
+    return 0;
+}
 #else
 static int BrokerPacketIdInQueue(const BrokerOutPub* out_q, word16 packet_id)
 {
@@ -5456,7 +5529,16 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
             out_pub.buffer = (rm->payload_len > 0) ? rm->payload : NULL;
             out_pub.total_len = rm->payload_len;
             if (eff_qos >= MQTT_QOS_1) {
-                out_pub.packet_id = BrokerNextPacketId(broker);
+                out_pub.packet_id = BrokerStaticOutId_Take(broker, bc);
+                if (out_pub.packet_id == 0) {
+            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
+             * because every one is still awaiting its acknowledgement.
+             * Reusing one would make the pending exchange ambiguous, so skip
+             * this delivery instead. */
+                    WBLOG_ERR(broker, "broker: static retained delivery "
+                        "dropped sock=%d (no free packet id)", (int)bc->sock);
+                    continue;
+                }
             }
 #ifdef WOLFMQTT_V5
             out_pub.protocol_level = bc->protocol_level;
@@ -5772,7 +5854,16 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                 out_pub.buffer = (payload_len > 0) ? (byte*)payload : NULL;
                 out_pub.total_len = payload_len;
                 if (eff_qos >= MQTT_QOS_1) {
-                    out_pub.packet_id = BrokerNextPacketId(broker);
+                    out_pub.packet_id = BrokerStaticOutId_Take(broker, wc);
+                    if (out_pub.packet_id == 0) {
+            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
+             * because every one is still awaiting its acknowledgement.
+             * Reusing one would make the pending exchange ambiguous, so skip
+             * this delivery instead. */
+                        WBLOG_ERR(broker, "broker: static delivery dropped "
+                            "sock=%d (no free packet id)", (int)wc->sock);
+                        continue;
+                    }
                 }
 #ifdef WOLFMQTT_V5
                 out_pub.protocol_level = wc->protocol_level;
@@ -7633,7 +7724,18 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                 out_pub.topic_name = topic;
                 out_pub.qos = eff_qos;
                 if (eff_qos >= MQTT_QOS_1) {
-                    out_pub.packet_id = BrokerNextPacketId(broker);
+                    out_pub.packet_id = BrokerStaticOutId_Take(broker,
+                        sub->client);
+                    if (out_pub.packet_id == 0) {
+            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
+             * because every one is still awaiting its acknowledgement.
+             * Reusing one would make the pending exchange ambiguous, so skip
+             * this delivery instead. */
+                        WBLOG_ERR(broker, "broker: static live delivery "
+                            "dropped sock=%d (no free packet id)",
+                            (int)sub->client->sock);
+                        continue;
+                    }
                 }
                 out_pub.retain = 0;
                 out_pub.duplicate = 0;
@@ -8381,6 +8483,9 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                         MQTT_PACKET_TYPE_PUBLISH_ACK, &ack_resp);
                 if (ack_rc >= 0) {
                 #ifdef WOLFMQTT_STATIC_MEMORY
+                    /* [MQTT-2.3.1-3] PUBACK completes the QoS 1 exchange, so
+                     * the identifier is free for the next delivery. */
+                    BrokerStaticOutId_Release(bc, ack_resp.packet_id);
                     BrokerStaticOrphan_OnPubAck(broker, bc,
                         ack_resp.packet_id);
                 #else
@@ -8436,6 +8541,8 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                         MQTT_PACKET_TYPE_PUBLISH_COMP, &comp_resp);
                 if (comp_rc >= 0) {
                 #ifdef WOLFMQTT_STATIC_MEMORY
+                    /* [MQTT-2.3.1-3] PUBCOMP completes the QoS 2 exchange. */
+                    BrokerStaticOutId_Release(bc, comp_resp.packet_id);
                     BrokerStaticOrphan_OnPubComp(broker, bc,
                         comp_resp.packet_id);
                 #else

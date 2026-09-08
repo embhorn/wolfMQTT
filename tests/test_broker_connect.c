@@ -4333,6 +4333,143 @@ static PublishInfo first_publish_info(const byte* buf, size_t len)
     return info;
 }
 
+#ifdef WOLFMQTT_STATIC_MEMORY
+/* Reads the broker's outbound in-flight table directly; the library helper
+ * has internal linkage. */
+static int static_out_id_in_use(const BrokerClient* bc, word16 packet_id)
+{
+    int i;
+
+    for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
+        if (bc->out_inflight[i] == packet_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Static-memory counterpart of find_broker_client: clients live in a fixed
+ * array rather than a list. */
+static BrokerClient* find_static_broker_client(MqttBroker* broker,
+    const char* id)
+{
+    int i;
+
+    for (i = 0; i < BROKER_MAX_CLIENTS; i++) {
+        if (broker->clients[i].in_use &&
+                XSTRCMP(broker->clients[i].client_id, id) == 0) {
+            return &broker->clients[i];
+        }
+    }
+    return NULL;
+}
+
+/* [MQTT-2.3.1-4] holds a Server sending a QoS > 0 PUBLISH to the same
+ * identifier rule as a Client: the value stays in use until the matching
+ * PUBACK is processed [MQTT-2.3.1-3]. The static-memory fan-out has no
+ * per-subscriber queue to derive that from, so it keeps its own in-flight
+ * table. Two deliveries with no PUBACK in between must not share an id, and
+ * the id must come back once the subscriber acknowledges it. */
+TEST(static_fanout_does_not_reuse_unacked_packet_id)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    BrokerClient* sub_bc;
+    word16 first_id;
+    word16 second_id;
+    size_t before;
+    int i;
+    static const byte connect_pub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'P'
+    };
+    static const byte connect_sub[] = {
+        0x10, 0x0D,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02, 0x00, 0x3C,
+        0x00, 0x01, 'S'
+    };
+    /* Subscribe to "x" at QoS 1 so the fan-out carries a Packet Identifier. */
+    static const byte subscribe_x[] = {
+        0x82, 0x06,
+        0x00, 0x01,
+        0x00, 0x01, 'x',
+        0x01
+    };
+    /* Hand-built MQTT v3.1.1 QoS 1 PUBLISH: Packet Identifier 7, topic "x",
+     * payload "A"; built from section 3.3, independent of the encoder. */
+    static const byte publish_x[] = {
+        0x32, 0x06,
+        0x00, 0x01, 'x',
+        0x00, 0x07,
+        'A'
+    };
+    PublishInfo info;
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_clients(2);
+    mock_client_input_append(0, connect_pub, sizeof(connect_pub));
+    mock_client_input_append(1, connect_sub, sizeof(connect_sub));
+    mock_client_input_append(1, subscribe_x, sizeof(subscribe_x));
+    for (i = 0; i < 16; i++) {
+        (void)MqttBroker_Step(&broker);
+    }
+    sub_bc = find_static_broker_client(&broker, "S");
+    ASSERT_NOT_NULL(sub_bc);
+
+    /* First delivery, left unacknowledged. */
+    before = g_clients[1].out_len;
+    mock_client_input_append(0, publish_x, sizeof(publish_x));
+    for (i = 0; i < 8; i++) {
+        (void)MqttBroker_Step(&broker);
+    }
+    info = first_publish_info(g_clients[1].out_buf + before,
+        g_clients[1].out_len - before);
+    ASSERT_TRUE(info.found);
+    first_id = info.packet_id;
+    ASSERT_TRUE(first_id != 0);
+    ASSERT_TRUE(static_out_id_in_use(sub_bc, first_id));
+
+    /* Second delivery while the first is still outstanding. */
+    before = g_clients[1].out_len;
+    mock_client_input_append(0, publish_x, sizeof(publish_x));
+    for (i = 0; i < 8; i++) {
+        (void)MqttBroker_Step(&broker);
+    }
+    info = first_publish_info(g_clients[1].out_buf + before,
+        g_clients[1].out_len - before);
+    ASSERT_TRUE(info.found);
+    second_id = info.packet_id;
+    ASSERT_TRUE(second_id != 0);
+    ASSERT_TRUE(second_id != first_id);
+
+    /* The subscriber acknowledges the first: that id becomes reusable. */
+    {
+        byte puback[4];
+        puback[0] = 0x40;
+        puback[1] = 0x02;
+        puback[2] = (byte)(first_id >> 8);
+        puback[3] = (byte)(first_id & 0xFF);
+        mock_client_input_append(1, puback, sizeof(puback));
+    }
+    for (i = 0; i < 8; i++) {
+        (void)MqttBroker_Step(&broker);
+    }
+    ASSERT_FALSE(static_out_id_in_use(sub_bc, first_id));
+    ASSERT_TRUE(static_out_id_in_use(sub_bc, second_id));
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+#endif /* WOLFMQTT_STATIC_MEMORY */
+
 #if defined(WOLFMQTT_NONBLOCK) && !defined(WOLFMQTT_STATIC_MEMORY)
 /* A zero-progress would-block result means none of the first transmission has
  * reached the network, so its later retry must still carry DUP=0
@@ -8271,6 +8408,7 @@ int main(int argc, char** argv)
 #if defined(WOLFMQTT_V5) && defined(WOLFMQTT_BROKER_WILL)
     RUN_TEST(connect_v5_oversize_will_payload_emits_connack);
     #ifdef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(static_fanout_does_not_reuse_unacked_packet_id);
     RUN_TEST(connect_v5_oversize_will_topic_emits_connack);
     #endif
 #endif
