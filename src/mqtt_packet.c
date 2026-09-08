@@ -2057,9 +2057,27 @@ int MqttDecode_ConnectAck(byte *rx_buf, int rx_buf_len,
         return header_len;
     }
 
-    /* Validate remain_len */
-    if (remain_len < 2) {
-        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+    /* Validate remain_len. MQTT 3.1.1 section 3.2.1 fixes the CONNACK
+     * Remaining Length at 2 - the Connect Acknowledge Flags and the Connect
+     * Return Code - and section 3.2.3 states the packet has no payload, so a
+     * larger value is a protocol violation the receiver must reject. MQTT 5.0
+     * section 3.2.2.1 appends a Properties block, so the longer form is only
+     * valid once the caller has identified the connection as v5. A NULL
+     * connect_ack takes the strict path: with no struct to carry properties,
+     * anything past the two fixed bytes cannot be consumed. */
+#ifdef WOLFMQTT_V5
+    if (connect_ack != NULL &&
+        connect_ack->protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+        if (remain_len < 2) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+        }
+    }
+    else
+#endif
+    {
+        if (remain_len != 2) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
+        }
     }
     if (rx_buf_len < header_len + remain_len) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_OUT_OF_BUFFER);
@@ -2785,6 +2803,16 @@ int MqttDecode_PublishResp(byte* rx_buf, int rx_buf_len, byte type,
             return tmp;
         }
         rx_payload += tmp;
+
+        /* A publish response echoes the Packet Identifier of the PUBLISH it
+         * acknowledges, and [MQTT-2.3.1-1] requires that identifier to be
+         * non-zero. Zero can never name an in-flight exchange, so treat it as
+         * the protocol violation it is and let the caller close the Network
+         * Connection per [MQTT-4.8.0-1], rather than silently discarding the
+         * packet as spurious. */
+        if (publish_resp->packet_id == 0) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PACKET_ID);
+        }
 
 #ifdef WOLFMQTT_V5
         publish_resp->props = NULL;

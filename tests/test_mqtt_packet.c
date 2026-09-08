@@ -1836,6 +1836,64 @@ TEST(decode_connack_truncated_partial_var_header)
     ASSERT_EQ(MQTT_CODE_ERROR_OUT_OF_BUFFER, rc);
 }
 
+/* MQTT 3.1.1 section 3.2.1 fixes the CONNACK Remaining Length at 2 and
+ * section 3.2.3 states "The CONNACK Packet has no payload". A CONNACK
+ * carrying a third byte is a protocol violation the receiver must reject so
+ * it closes the Network Connection per [MQTT-4.8.0-1].
+ *
+ * Wire layout, hand-built from section 3.2:
+ *   0x20        fixed header, type 2 (CONNACK), reserved flags 0
+ *   0x03        Remaining Length = 3 (must be 2)
+ *   0x00        Connect Acknowledge Flags, Session Present = 0
+ *   0x00        Connect Return Code, 0 = Connection Accepted
+ *   0xFF        extra byte the spec does not allow
+ */
+TEST(decode_connack_v311_extra_payload_rejected)
+{
+    byte buf[] = { 0x20, 0x03, 0x00, 0x00, 0xFF };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+}
+
+/* Positive control for the same gate: the identical prefix with the correct
+ * Remaining Length of 2 must still decode. Pins the check to the length
+ * rather than to the presence of trailing bytes in the caller's buffer. */
+TEST(decode_connack_v311_exact_remain_len_accepted)
+{
+    byte buf[] = { 0x20, 0x02, 0x00, 0x00 };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(4, rc);
+    ASSERT_EQ(0, ack.flags);
+    ASSERT_EQ(MQTT_CONNECT_ACK_CODE_ACCEPTED, ack.return_code);
+}
+
+#ifdef WOLFMQTT_V5
+/* MQTT 5.0 section 3.2.2.1 appends a Properties block to the CONNACK variable
+ * header, so a v5 session must still accept Remaining Length > 2. Pins the v5
+ * arm of the gate so the v3.1.1 exact-length rule cannot regress onto v5 -
+ * the wire is remain_len = 3 = flags + reason code + props_len(0). */
+TEST(decode_connack_v5_longer_remain_len_accepted)
+{
+    byte buf[] = { 0x20, 0x03, 0x00, MQTT_REASON_SUCCESS, 0x00 };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(5, rc);
+    MqttProps_Free(ack.props);
+}
+#endif /* WOLFMQTT_V5 */
+
 #ifdef WOLFMQTT_V5
 /* MQTT 5.0 section 3.2.2.3: the Property Length belongs to this CONNACK,
  * so bytes after its declared Remaining Length cannot satisfy the property
@@ -4953,6 +5011,85 @@ TEST(decode_pubcomp_v311_valid)
     ASSERT_EQ(7, resp.packet_id);
 }
 
+/* [MQTT-2.3.1-1] requires the Packet Identifier of a QoS > 0 PUBLISH to be
+ * non-zero, and a publish response echoes the identifier of the PUBLISH it
+ * acknowledges (sections 3.4.2, 3.5.2, 3.6.2, 3.7.2). A zero identifier can
+ * therefore never name an in-flight exchange: it is a protocol violation, and
+ * [MQTT-4.8.0-1] requires the receiver to close the Network Connection rather
+ * than discard the packet as spurious.
+ *
+ * Wire layout, hand-built from section 3.4:
+ *   0x40        fixed header, type 4 (PUBACK), reserved flags 0
+ *   0x02        Remaining Length = 2
+ *   0x00 0x00   Packet Identifier = 0, which the spec forbids
+ */
+TEST(decode_puback_packet_id_zero_rejected)
+{
+    byte buf[] = { 0x40, 0x02, 0x00, 0x00 };
+    MqttPublishResp resp;
+    int rc;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, (int)sizeof(buf),
+        MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+}
+
+/* PUBREC, section 3.5: type 5, reserved flags 0. */
+TEST(decode_pubrec_packet_id_zero_rejected)
+{
+    byte buf[] = { 0x50, 0x02, 0x00, 0x00 };
+    MqttPublishResp resp;
+    int rc;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, (int)sizeof(buf),
+        MQTT_PACKET_TYPE_PUBLISH_REC, &resp);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+}
+
+/* PUBREL, section 3.6: type 6, and [MQTT-3.6.1-1] fixes its reserved flags
+ * at 0010, hence 0x62 rather than 0x60. */
+TEST(decode_pubrel_packet_id_zero_rejected)
+{
+    byte buf[] = { 0x62, 0x02, 0x00, 0x00 };
+    MqttPublishResp resp;
+    int rc;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, (int)sizeof(buf),
+        MQTT_PACKET_TYPE_PUBLISH_REL, &resp);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+}
+
+/* PUBCOMP, section 3.7: type 7, reserved flags 0. */
+TEST(decode_pubcomp_packet_id_zero_rejected)
+{
+    byte buf[] = { 0x70, 0x02, 0x00, 0x00 };
+    MqttPublishResp resp;
+    int rc;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, (int)sizeof(buf),
+        MQTT_PACKET_TYPE_PUBLISH_COMP, &resp);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+}
+
+/* Positive control: Packet Identifier 1 is the smallest legal value and must
+ * still decode, so the guard rejects only zero. */
+TEST(decode_puback_packet_id_one_accepted)
+{
+    byte buf[] = { 0x40, 0x02, 0x00, 0x01 };
+    MqttPublishResp resp;
+    int rc;
+
+    XMEMSET(&resp, 0, sizeof(resp));
+    rc = MqttDecode_PublishResp(buf, (int)sizeof(buf),
+        MQTT_PACKET_TYPE_PUBLISH_ACK, &resp);
+    ASSERT_EQ(4, rc);
+    ASSERT_EQ(1, resp.packet_id);
+}
+
 /* publish_resp == NULL takes the strict-length path even under
  * WOLFMQTT_V5: with no struct to consume reason_code/props, anything
  * beyond the Packet Identifier is unreachable extra payload. Pins the
@@ -6413,7 +6550,10 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_truncated_one_byte_buffer);
     RUN_TEST(decode_connack_truncated_no_var_header);
     RUN_TEST(decode_connack_truncated_partial_var_header);
+    RUN_TEST(decode_connack_v311_extra_payload_rejected);
+    RUN_TEST(decode_connack_v311_exact_remain_len_accepted);
 #ifdef WOLFMQTT_V5
+    RUN_TEST(decode_connack_v5_longer_remain_len_accepted);
     RUN_TEST(decode_connack_v5_props_cannot_cross_packet_end);
     RUN_TEST(decode_connack_v5_rejects_bytes_after_property_block);
 #endif
@@ -6602,6 +6742,11 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_pubrel_v311_valid);
     RUN_TEST(decode_pubcomp_v311_valid);
     RUN_TEST(decode_puback_null_resp_extra_payload_rejected);
+    RUN_TEST(decode_puback_packet_id_zero_rejected);
+    RUN_TEST(decode_pubrec_packet_id_zero_rejected);
+    RUN_TEST(decode_pubrel_packet_id_zero_rejected);
+    RUN_TEST(decode_pubcomp_packet_id_zero_rejected);
+    RUN_TEST(decode_puback_packet_id_one_accepted);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_puback_v5_with_reason_code_accepted);
     RUN_TEST(decode_puback_v5_reason_code_past_buf_rejected);
