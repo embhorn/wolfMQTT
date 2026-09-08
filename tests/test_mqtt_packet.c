@@ -2717,6 +2717,78 @@ TEST(encode_connect_username_and_password)
  * (0xC0 0xAF is an overlong sequence Utf8WellFormed rejects). Locks in that
  * the Password field bypasses encode-side UTF-8 validation, unlike the
  * username/client_id/topic string fields. */
+/* [MQTT-3.1.3.5] the Password is "Binary Data", 0 to 65535 bytes with a
+ * two-byte length prefix, so an embedded 0x00 is legal. Without an explicit
+ * length the encoder measured it with XSTRLEN and truncated at that byte.
+ *
+ * Wire layout, hand-built from section 3.1:
+ *   10 18                  CONNECT, Remaining Length 24
+ *   00 04 4D 51 54 54      protocol name "MQTT"
+ *   04                     protocol level 4
+ *   C0                     flags: User Name + Password
+ *   00 00                  keep alive 0
+ *   00 03 63 69 64         ClientId "cid"
+ *   00 04 75 73 65 72      User Name "user"
+ *   00 03 41 00 42         Password 'A' 0x00 'B'  <- the three bytes at issue
+ */
+TEST(encode_connect_binary_password_with_len_not_truncated)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    static const char password[] = { 'A', '\0', 'B', '\0' };
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    conn.clean_session = 1;
+    conn.username = "user";
+    conn.password = password;
+    conn.password_len = 3;
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+
+    /* Password field sits last: after the 10-byte variable header, the
+     * ClientId (2+3) and the User Name (2+4). */
+    {
+        int off = 2 + 10 + 2 + 3 + 2 + 4;
+        ASSERT_EQ(0x00, (int)tx_buf[off]);
+        ASSERT_EQ(0x03, (int)tx_buf[off + 1]);
+        ASSERT_EQ('A',  (int)tx_buf[off + 2]);
+        ASSERT_EQ(0x00, (int)tx_buf[off + 3]);
+        ASSERT_EQ('B',  (int)tx_buf[off + 4]);
+        ASSERT_EQ(off + 5, rc);
+    }
+}
+
+/* password_len 0 keeps the original NUL-terminated behaviour, so existing
+ * callers that never set the field are unaffected. */
+TEST(encode_connect_password_len_zero_uses_strlen)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    conn.clean_session = 1;
+    conn.username = "user";
+    conn.password = "pw";
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    {
+        int off = 2 + 10 + 2 + 3 + 2 + 4;
+        ASSERT_EQ(0x00, (int)tx_buf[off]);
+        ASSERT_EQ(0x02, (int)tx_buf[off + 1]);
+        ASSERT_EQ('p',  (int)tx_buf[off + 2]);
+        ASSERT_EQ('w',  (int)tx_buf[off + 3]);
+        ASSERT_EQ(off + 4, rc);
+    }
+}
+
 TEST(encode_connect_binary_password_accepted)
 {
     byte tx_buf[256];
@@ -6691,6 +6763,8 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_v5_unsupported);
 #endif
     RUN_TEST(encode_connect_username_and_password);
+    RUN_TEST(encode_connect_binary_password_with_len_not_truncated);
+    RUN_TEST(encode_connect_password_len_zero_uses_strlen);
     RUN_TEST(encode_connect_binary_password_accepted);
     RUN_TEST(encode_connect_invalid_utf8_clientid_rejected);
     RUN_TEST(encode_connect_invalid_utf8_username_rejected);

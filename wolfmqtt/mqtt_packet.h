@@ -488,6 +488,14 @@ typedef struct _MqttConnect {
 #ifdef WOLFMQTT_V5
     MqttProp* props;
 #endif
+
+    /* Length of `password` in bytes. [MQTT-3.1.3.5] defines the Password as
+     * Binary Data, which may legally contain 0x00, so a NUL-terminated string
+     * cannot express every valid value. Leave 0 to keep the original
+     * behaviour of measuring `password` with XSTRLEN; set it to send binary
+     * password bytes verbatim. Added at the end of the struct so existing
+     * binaries keep their layout. */
+    word16      password_len;
 } MqttConnect;
 
 

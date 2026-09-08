@@ -1591,7 +1591,12 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
         remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
     }
     if (mc_connect->password) {
-        size_t str_len = XSTRLEN(mc_connect->password);
+        /* [MQTT-3.1.3.5] Password is Binary Data. An explicit password_len
+         * carries bytes that XSTRLEN would truncate at an embedded 0x00; 0
+         * keeps the original NUL-terminated behaviour. */
+        size_t str_len = (mc_connect->password_len > 0) ?
+            (size_t)mc_connect->password_len :
+            XSTRLEN(mc_connect->password);
         if (str_len > (size_t)0xFFFF) {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
         }
@@ -1696,7 +1701,8 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
          * bound was already enforced above. */
         tx_payload += MqttEncode_Data(tx_payload,
             (const byte*)mc_connect->password,
-            (word16)XSTRLEN(mc_connect->password));
+            (mc_connect->password_len > 0) ? mc_connect->password_len :
+                (word16)XSTRLEN(mc_connect->password));
     }
     (void)tx_payload;
 
