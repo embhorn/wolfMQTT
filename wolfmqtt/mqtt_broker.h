@@ -670,10 +670,15 @@ typedef struct BrokerClient {
 #endif
     byte          session_established;
 #ifndef WOLFMQTT_STATIC_MEMORY
-    /* Length of an accepted CONNACK still being written (0 = none). While
-     * nonzero, tx_buf is owned by that write and no other packet may be
-     * read from or written to this client. */
+    /* Length of a CONNACK still being written (0 = none). While nonzero,
+     * tx_buf is owned by that write and no other packet may be read from or
+     * written to this client. */
     int           connack_pending_len;
+    /* The pending CONNACK carries a non-zero return code. MQTT 3.1.1 section
+     * 3.1.4 requires the Server to send the refusal and then close the
+     * Network Connection, so the client is kept only until those bytes are
+     * fully delivered and is then dropped without becoming connected. */
+    unsigned int  connack_refused : 1;
 #endif
 } BrokerClient;
 

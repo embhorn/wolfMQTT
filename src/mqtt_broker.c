@@ -1121,6 +1121,16 @@ static int callback_broker_mqtt(struct lws *wsi,
         ws = (BrokerWsCtx*)bc->ws_ctx;
         if (ws == NULL || in == NULL || len == 0) return 0;
 
+        /* [MQTT-6.0.0-1] MQTT over WebSocket is carried in binary data
+         * frames: "If any other type of data frame is received the recipient
+         * MUST close the Network Connection." A text frame's payload is not
+         * an MQTT byte stream, so it must never reach the packet parser. */
+        if (!lws_frame_is_binary(wsi)) {
+            WBLOG_ERR(broker, "broker: ws non-binary data frame wsi=%p "
+                "[MQTT-6.0.0-1]", (void*)wsi);
+            return -1; /* close connection */
+        }
+
         /* Append data to rx_buffer */
         if (ws->rx_len + len <= sizeof(ws->rx_buffer)) {
             XMEMCPY(ws->rx_buffer + ws->rx_len, in, len);
@@ -2145,6 +2155,40 @@ static int BrokerClient_DrainOutQueue(BrokerClient* bc)
                  * on the next reconnect. Subsequent writes on the
                  * same dead socket would just stack more errors, so
                  * stop the drain here. */
+                if (bc->client.write.pos > 0 && cur->qos > MQTT_QOS_0) {
+                    /* Part of this PUBLISH did reach the subscriber before
+                     * the error - a blocking write loop leaves write.pos at
+                     * what it managed to send, and a resumed nonblocking
+                     * write keeps its offset. The replay after session
+                     * recovery is therefore a re-delivery attempt and
+                     * [MQTT-3.3.1-1] requires it to carry DUP=1, the same
+                     * as the MQTT_CODE_CONTINUE case above. */
+                    cur->retransmit_dup = 1;
+                }
+                else if (bc->client.write.pos > 0) {
+                    /* MQTT 3.1.1 section 4.3.1: at QoS 0 "no retry is
+                     * performed by the sender" and the message "arrives at the
+                     * receiver either once or not at all". Bytes of this
+                     * PUBLISH are already on the wire, so leaving the entry
+                     * queued would let it follow the Session into an orphan
+                     * and be sent a second time after reconnect. Section 4.1
+                     * makes only QoS 0 messages *pending transmission*
+                     * optional Session state, and this one is no longer
+                     * pending - drop it. */
+                    BrokerOutPub* free_me = cur;
+
+                    if (prev == NULL) {
+                        bc->out_q_head = cur->next;
+                    }
+                    else {
+                        prev->next = cur->next;
+                    }
+                    if (bc->out_q_tail == cur) {
+                        bc->out_q_tail = prev;
+                    }
+                    bc->out_q_count--;
+                    BrokerOutPub_Free(free_me);
+                }
                 WBLOG_ERR(bc->broker,
                     "broker: drain write failed sock=%d topic=%s rc=%d",
                     (int)bc->sock, BrokerLog_Sanitize(cur->topic), wr_rc);
@@ -6956,6 +7000,18 @@ send_connack:
 
     /* Return 0 if auth rejected so caller can disconnect */
     if (ack.return_code != MQTT_CONNECT_ACK_CODE_ACCEPTED) {
+#ifndef WOLFMQTT_STATIC_MEMORY
+        if (rc == MQTT_CODE_CONTINUE) {
+            /* MQTT 3.1.1 section 3.1.4 has the Server send a CONNACK carrying
+             * the non-zero return code and then close the Network Connection.
+             * Closing now would deliver only the bytes already written, so the
+             * client could never read why it was refused. Keep the socket open
+             * until BrokerClient_ResumeConnAck finishes the write; it then
+             * performs the close. */
+            bc->connack_pending_len = ack_len;
+            bc->connack_refused = 1;
+        }
+#endif
         return 0;
     }
 
@@ -7989,6 +8045,29 @@ static void BrokerClient_AbnormalClose(MqttBroker* broker, BrokerClient* bc)
     BrokerClient_Remove(broker, bc);
 }
 
+/* Tear down a client whose CONNECT did not leave it live. A refused or
+ * undecodable CONNECT established no Session, so its tracking is simply
+ * dropped. A CONNECT accepted internally whose CONNACK could not be written
+ * did resume or create Session state; preserve that according to the
+ * negotiated expiry. No Will is published: a client refused at CONNECT never
+ * had one stored, and an accepted-but-unacknowledged one is handled by the
+ * abnormal-close path instead. */
+static void BrokerClient_EndConnect(MqttBroker* broker, BrokerClient* bc)
+{
+    if (bc->session_established) {
+        if (bc->session_expiry_sec == 0) {
+            BrokerSubs_EndClientSession(broker, bc);
+        }
+        else {
+            BrokerSubs_OrphanClient(broker, bc);
+        }
+    }
+    else {
+        BrokerSubs_RemoveClient(broker, bc);
+    }
+    BrokerClient_Remove(broker, bc);
+}
+
 /* Returns non-zero for return codes that require the broker to close the
  * client connection. Includes:
  *   - Wire-level decode errors (malformed packet, wrong packet type).
@@ -8013,13 +8092,17 @@ static int BrokerRcIsFatal(int rc)
 }
 
 #ifndef WOLFMQTT_STATIC_MEMORY
-/* Finish an accepted CONNACK whose write returned MQTT_CODE_CONTINUE. Returns
- * CONTINUE while it is still in flight, MQTT_CODE_SUCCESS once fully written
- * (deliveries queued meanwhile are then drained), or a negative code after
- * closing the client on a write failure. */
+/* Finish a CONNACK whose write returned MQTT_CODE_CONTINUE. Returns CONTINUE
+ * while it is still in flight and MQTT_CODE_SUCCESS once an accepted CONNACK
+ * is fully written (deliveries queued meanwhile are then drained). Any other
+ * value means the client has been removed and the caller must not touch it
+ * again: either the write failed, or a refused CONNACK finished delivering its
+ * return code and the Network Connection was closed as section 3.1.4
+ * requires. */
 static int BrokerClient_ResumeConnAck(MqttBroker* broker, BrokerClient* bc)
 {
     int rc;
+    int refused = (bc->connack_refused != 0);
 
     rc = MqttPacket_Write(&bc->client, bc->tx_buf, bc->connack_pending_len);
     if (rc == MQTT_CODE_CONTINUE) {
@@ -8029,10 +8112,30 @@ static int BrokerClient_ResumeConnAck(MqttBroker* broker, BrokerClient* bc)
         WBLOG_ERR(broker, "broker: CONNACK write failed sock=%d rc=%d",
             (int)bc->sock, rc);
         bc->connack_pending_len = 0;
-        BrokerClient_AbnormalClose(broker, bc);
+        bc->connack_refused = 0;
+        if (refused) {
+            BrokerClient_EndConnect(broker, bc);
+        }
+        else {
+            BrokerClient_AbnormalClose(broker, bc);
+        }
         return (rc < 0) ? rc : MQTT_CODE_ERROR_NETWORK;
     }
     bc->connack_pending_len = 0;
+    if (refused) {
+        /* The refusal reached the client in full; now close the Network
+         * Connection, which is what the immediate close was trying to do
+         * before it truncated the return code. */
+        bc->connack_refused = 0;
+        WBLOG_INFO(broker, "broker: refused CONNACK delivered sock=%d",
+            (int)bc->sock);
+        BrokerClient_EndConnect(broker, bc);
+        return MQTT_CODE_ERROR_NETWORK;
+    }
+    /* The CONNACK step is complete, so keep alive monitoring starts now
+     * (MQTT 3.1.1 section 3.1.4). Re-baseline the deadline off this moment
+     * rather than the CONNECT that arrived before the slow write. */
+    bc->last_rx = WOLFMQTT_BROKER_GET_TIME_S();
     if (bc->out_q_count > 0) {
         BrokerClient_DrainOutQueue(bc);
     }
@@ -8240,24 +8343,17 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                         && bc->connack_pending_len == 0
             #endif
                         ) {
-                    /* Refused/decode-failed CONNECTs have no established
-                     * Session. A CONNECT accepted internally whose CONNACK
-                     * write failed has already resumed/created Session state;
-                     * preserve it according to the negotiated expiry. */
-                    if (bc->session_established) {
-                        if (bc->session_expiry_sec == 0) {
-                            BrokerSubs_EndClientSession(broker, bc);
-                        }
-                        else {
-                            BrokerSubs_OrphanClient(broker, bc);
-                        }
-                    }
-                    else {
-                        BrokerSubs_RemoveClient(broker, bc);
-                    }
-                    BrokerClient_Remove(broker, bc);
+                    BrokerClient_EndConnect(broker, bc);
                     return 0;
                 }
+            #ifndef WOLFMQTT_STATIC_MEMORY
+                if (bc->connack_refused) {
+                    /* The refusal is still going out. The client is not
+                     * connected and must not be marked so; ResumeConnAck
+                     * closes it once the return code has been delivered. */
+                    break;
+                }
+            #endif
                 bc->connected = 1;
                 break;
             }
@@ -8509,6 +8605,36 @@ check_timeouts:
 #endif
 
     /* Check keepalive timeout (MQTT spec 3.1.2.10: 1.5x keep alive) */
+#ifndef WOLFMQTT_STATIC_MEMORY
+    if (bc->connack_pending_len != 0) {
+        /* MQTT 3.1.1 section 3.1.4 orders "Start message delivery and keep
+         * alive monitoring" after the CONNACK step, so an accepted CONNACK
+         * that is still only partly written must not be cut short by this
+         * client's own keepalive deadline. Reads are withheld until that write
+         * completes, so last_rx cannot advance meanwhile and the deadline
+         * would otherwise always win on a slow link. The handshake stays
+         * bounded by BROKER_CONNECT_TIMEOUT_SEC (measured from the CONNECT
+         * that produced this CONNACK) so a peer that never drains its socket
+         * cannot hold the client slot forever. */
+        WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
+
+        if (now >= bc->last_rx && (now - bc->last_rx) >
+                (WOLFMQTT_BROKER_TIME_T)BROKER_CONNECT_TIMEOUT_SEC) {
+            WBLOG_ERR(broker, "broker: CONNACK write timeout sock=%d",
+                (int)bc->sock);
+            bc->connack_pending_len = 0;
+            if (bc->connack_refused) {
+                bc->connack_refused = 0;
+                BrokerClient_EndConnect(broker, bc);
+            }
+            else {
+                BrokerClient_AbnormalClose(broker, bc);
+            }
+            return 0;
+        }
+    }
+    else
+#endif
     if (bc->keep_alive_sec > 0) {
         WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
         WOLFMQTT_BROKER_TIME_T deadline = (WOLFMQTT_BROKER_TIME_T)
