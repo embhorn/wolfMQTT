@@ -46,6 +46,51 @@
       `cmd_timeout_ms`. This is the only v5 rejection surfaced on the write-only
       path; a QoS 1 PUBACK or QoS 2 PUBCOMP reason code >= 0x80 is still not
       detected there. Supersedes the v2.1.0 note below.
+    - The client now tracks the MQTT handshake separately from the transport.
+      `MqttClient_Publish`, `MqttClient_Subscribe`, `MqttClient_Unsubscribe`,
+      `MqttClient_Ping` and `MqttClient_Disconnect` return
+      `MQTT_CODE_ERROR_STAT` when called before `MqttClient_Connect` on a
+      Network Connection [MQTT-3.1.0-1], and a second `MqttClient_Connect` on
+      the same connection is refused with the same code [MQTT-3.1.0-2]. An
+      application that reconnects must call `MqttClient_NetDisconnect` first,
+      as the bundled examples already do (#590, #591)
+    - The client keeps a connection-level record of outbound Packet
+      Identifiers still awaiting their `PUBACK`, `PUBCOMP`, `SUBACK` or
+      `UNSUBACK`, in every build rather than only under
+      `WOLFMQTT_MULTITHREAD`. A new `SUBSCRIBE`, `UNSUBSCRIBE` or QoS>0
+      `PUBLISH` reusing one is refused with `MQTT_CODE_ERROR_PACKET_ID`
+      [MQTT-2.3.1-2]. Re-sending the same `PUBLISH` with `duplicate` set keeps
+      its identifier, as [MQTT-2.3.1-3] requires. The window is
+      `MQTT_MAX_SEND_INFLIGHT` (16 by default), overridable in
+      `user_settings.h` (#589, #599, #601, #605, #611, #612, #613)
+    - `MqttEncode_Connect` rejects a zero-byte ClientId paired with
+      `clean_session` 0 for MQTT v3.1.1 [MQTT-3.1.3-7]. MQTT v5.0 drops the
+      coupling and still allows it (#585)
+
+* Fixes
+    - The v3.1.1 `CONNACK` decoder accepted a Remaining Length above 2 and
+      swallowed the extra bytes; it now requires exactly 2 outside v5 (#603)
+    - `PUBACK`, `PUBREC`, `PUBREL` and `PUBCOMP` carrying Packet Identifier 0
+      were treated as spurious and ignored. They are now rejected with
+      `MQTT_CODE_ERROR_PACKET_ID`, which closes the connection
+      [MQTT-4.8.0-1] (#607)
+    - Broker: a refused `CONNACK` whose write returned `MQTT_CODE_CONTINUE`
+      was never resumed, so the client saw a truncated packet and never
+      received the return code. The connection is now held open until the
+      refusal is fully written and then closed (#592)
+    - Broker: keep-alive monitoring no longer runs while an accepted `CONNACK`
+      is still partly written, which could close the connection mid-handshake
+      in `WOLFMQTT_NONBLOCK` builds. The handshake stays bounded by
+      `BROKER_CONNECT_TIMEOUT_SEC` (#594)
+    - Broker: a QoS>0 `PUBLISH` that got some bytes out and then failed inside
+      one blocking write is now marked for retransmission, so session recovery
+      replays it with `DUP` set [MQTT-3.3.1-1] (#604)
+    - Broker: a partly written QoS 0 `PUBLISH` is dropped instead of following
+      the session into an orphan, where it was delivered a second time after
+      reconnect. QoS 0 allows no sender retry (#596)
+    - WebSocket: both receive callbacks now close the connection on a
+      non-binary data frame instead of feeding its payload to the MQTT parser
+      [MQTT-6.0.0-1] (#610)
 
 ### v2.1.0 (07/02/2026)
 Release 2.1.0 has been developed according to wolfSSL's development and QA
