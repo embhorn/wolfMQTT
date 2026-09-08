@@ -103,6 +103,18 @@
       Dynamic-memory builds already derived this from the per-subscriber
       queue. A delivery is skipped rather than sent with a reused identifier
       when all BROKER_MAX_INFLIGHT_PER_SUB slots are outstanding (#614)
+    - The client now keeps unacknowledged outbound QoS > 0 messages as Session
+      state and re-sends them after a `CleanSession=0` reconnect the server
+      answers with Session Present = 1: a PUBLISH goes out again with its
+      original Packet Identifier and `DUP` set, and a QoS 2 exchange already
+      past PUBREC re-sends the PUBREL instead [MQTT-4.4.0-1],
+      [MQTT-3.3.1-1]. Replaying a PUBLISH needs its topic and payload after
+      the caller's `MqttPublish` is gone, so the client copies them into a
+      bounded pool of `MQTT_MAX_REPLAY_MSGS` entries (4 by default; under
+      `WOLFMQTT_STATIC_MEMORY` also bounded by `MQTT_MAX_REPLAY_TOPIC` and
+      `MQTT_MAX_REPLAY_PAYLOAD`). A message that does not fit, or one streamed
+      through a payload callback, is still sent but not retained. Define
+      `WOLFMQTT_NO_SESSION_REPLAY` to compile the store out (#597, #598, #602)
     - The QoS acknowledgement for a received PUBLISH is now staged on the wait
       object rather than in a field shared by every reader. Another thread
       completing its own read could previously overwrite it between the read
