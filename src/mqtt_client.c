@@ -2525,13 +2525,6 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
-        /* A new handshake starts a fresh outbound Packet Identifier space:
-         * the client keeps no unacknowledged outbound PUBLISH/PUBREL across a
-         * Network Connection, so nothing from the previous one is still in
-         * flight [MQTT-2.3.1-3]. Must stay outside the WOLFMQTT_V5 block
-         * below - the table exists in every build. */
-        MqttClient_SendIdsReset(client);
-
         /* [MQTT-3.1.0-2] A Client can only send the CONNECT Packet once over a
          * Network Connection; a Server must treat a second one as a protocol
          * violation and disconnect. A partially written CONNECT re-enters with
@@ -2543,6 +2536,17 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
                 MQTT_CLIENT_FLAG_CONNECT_SENT) != 0) {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
         }
+
+        /* Past the guard, so this really is a new handshake: start a fresh
+         * outbound Packet Identifier space. The client keeps no
+         * unacknowledged outbound PUBLISH/PUBREL across a Network Connection,
+         * so nothing from a previous one is still in flight [MQTT-2.3.1-3].
+         * Must run after the guard above - a refused duplicate CONNECT would
+         * otherwise wipe identifiers still in flight on the live connection -
+         * and outside the WOLFMQTT_V5 block below, since the table exists in
+         * every build. */
+        MqttClient_SendIdsReset(client);
+
     #ifdef WOLFMQTT_V5
         #ifdef WOLFMQTT_MULTITHREAD
         rc = wm_SemLock(&client->lockClient);

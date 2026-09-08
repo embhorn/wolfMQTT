@@ -4341,7 +4341,7 @@ static int static_out_id_in_use(const BrokerClient* bc, word16 packet_id)
     int i;
 
     for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
-        if (bc->out_inflight[i] == packet_id) {
+        if (bc->out_inflight[i].packet_id == packet_id) {
             return 1;
         }
     }
@@ -4470,6 +4470,25 @@ TEST(static_fanout_does_not_reuse_unacked_packet_id)
 
 #endif /* WOLFMQTT_STATIC_MEMORY */
 
+#ifndef WOLFMQTT_STATIC_MEMORY
+/* Find the orphan session carrying a disconnected client's Session state. The
+ * BrokerClient itself is freed by the close, so anything a test wants to check
+ * about the preserved queue must be read from here. */
+static BrokerOrphanSession* find_orphan_session(MqttBroker* broker,
+    const char* id)
+{
+    BrokerOrphanSession* o = broker->orphan_sessions;
+
+    while (o != NULL) {
+        if (o->client_id != NULL && XSTRCMP(o->client_id, id) == 0) {
+            return o;
+        }
+        o = o->next;
+    }
+    return NULL;
+}
+#endif /* !WOLFMQTT_STATIC_MEMORY */
+
 #if defined(WOLFMQTT_NONBLOCK) && !defined(WOLFMQTT_STATIC_MEMORY)
 /* A zero-progress would-block result means none of the first transmission has
  * reached the network, so its later retry must still carry DUP=0
@@ -4556,6 +4575,7 @@ TEST(outbound_qos0_partial_failure_not_replayed_on_reconnect)
     MqttBroker broker;
     MqttBrokerNet net;
     BrokerClient* sub_bc;
+    BrokerOrphanSession* orphan;
     int i;
     static const byte connect_pub[] = {
         0x10, 0x0D,
@@ -4607,17 +4627,21 @@ TEST(outbound_qos0_partial_failure_not_replayed_on_reconnect)
     ASSERT_EQ(MQTT_QOS_0, sub_bc->out_q_head->qos);
     ASSERT_TRUE(sub_bc->client.write.pos > 0);
 
+    /* The failing write closes the client, so sub_bc is freed from here on and
+     * the preserved queue must be inspected through the orphan session. */
     g_clients[1].write_err = 1;
-    (void)MqttBroker_Step(&broker);
-    /* The attempted QoS 0 message is gone rather than queued for replay. */
-    ASSERT_NULL(sub_bc->out_q_head);
-    ASSERT_EQ(0, sub_bc->out_q_count);
-
     for (i = 0; i < 4; i++) {
         (void)MqttBroker_Step(&broker);
     }
     ASSERT_TRUE(g_clients[1].closed);
     ASSERT_EQ(1, broker.orphan_session_count);
+
+    /* The attempted QoS 0 message did not follow the Session into the orphan;
+     * only QoS > 0 state is preserved for replay. */
+    orphan = find_orphan_session(&broker, "S");
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_NULL(orphan->out_q_head);
+    ASSERT_EQ(0, orphan->out_q_count);
 
     /* Reconnect the same persistent Session: only the CONNACK comes back,
      * with no second copy of the QoS 0 PUBLISH. */
@@ -4729,6 +4753,7 @@ TEST(outbound_blocking_partial_failure_reconnect_sets_dup)
     MqttBroker broker;
     MqttBrokerNet net;
     BrokerClient* sub_bc;
+    BrokerOrphanSession* orphan;
     PublishInfo info;
     word16 packet_id;
     int i;
@@ -4776,22 +4801,27 @@ TEST(outbound_blocking_partial_failure_reconnect_sets_dup)
     ASSERT_NOT_NULL(sub_bc);
 
     /* One byte of the queued delivery goes out, then the socket errors -
-     * both within the single blocking write. */
+     * both within the single blocking write. That failure closes the client,
+     * so sub_bc is freed and the entry must be inspected via the orphan. */
     g_clients[1].write_limit_then_err = 1;
     mock_client_input_append(0, publish_x, sizeof(publish_x));
     (void)MqttBroker_Step(&broker);
-    ASSERT_NOT_NULL(sub_bc->out_q_head);
-    ASSERT_TRUE(sub_bc->client.write.pos > 0);
-    ASSERT_EQ(1, sub_bc->out_q_head->retransmit_dup);
-    packet_id = sub_bc->out_q_head->packet_id;
-    ASSERT_TRUE(packet_id != 0);
 
+    /* The fan-out drain discards its result, so the close lands on a later
+     * step. It frees sub_bc, hence the orphan lookup below. */
     g_clients[1].write_err = 1;
     for (i = 0; i < 4; i++) {
         (void)MqttBroker_Step(&broker);
     }
     ASSERT_TRUE(g_clients[1].closed);
     ASSERT_EQ(1, broker.orphan_session_count);
+
+    orphan = find_orphan_session(&broker, "S");
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_NOT_NULL(orphan->out_q_head);
+    ASSERT_EQ(1, orphan->out_q_head->retransmit_dup);
+    packet_id = orphan->out_q_head->packet_id;
+    ASSERT_TRUE(packet_id != 0);
 
     /* Reconnect the same persistent Session and inspect its replayed PUBLISH. */
     mock_client_input_append(2, connect_sub, sizeof(connect_sub));
@@ -8408,9 +8438,11 @@ int main(int argc, char** argv)
 #if defined(WOLFMQTT_V5) && defined(WOLFMQTT_BROKER_WILL)
     RUN_TEST(connect_v5_oversize_will_payload_emits_connack);
     #ifdef WOLFMQTT_STATIC_MEMORY
-    RUN_TEST(static_fanout_does_not_reuse_unacked_packet_id);
     RUN_TEST(connect_v5_oversize_will_topic_emits_connack);
     #endif
+#endif
+#ifdef WOLFMQTT_STATIC_MEMORY
+    RUN_TEST(static_fanout_does_not_reuse_unacked_packet_id);
 #endif
     RUN_TEST(connect_v311_explicit_auto_prefix_refused);
     RUN_TEST(connect_unsupported_level_3_refused);

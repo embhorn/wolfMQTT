@@ -568,6 +568,12 @@ typedef struct BrokerOrphanSession {
 /* -------------------------------------------------------------------------- */
 /* Broker client tracking                                                      */
 /* -------------------------------------------------------------------------- */
+/* One outbound QoS > 0 delivery this client has not acknowledged yet. */
+typedef struct BrokerStaticOutId {
+    word16  packet_id;      /* 0 = empty slot */
+    MqttQoS qos;            /* QoS the delivery went out with */
+} BrokerStaticOutId;
+
 typedef struct BrokerClient {
 #ifdef WOLFMQTT_STATIC_MEMORY
     byte    in_use;
@@ -645,10 +651,13 @@ typedef struct BrokerClient {
     /* Outbound QoS 1/2 Packet Identifiers sent to this client and not yet
      * released by its PUBACK or PUBCOMP. [MQTT-2.3.1-4] applies the Client
      * identifier rule to a Server sending a QoS > 0 PUBLISH, so a new one
-     * must not reuse an identifier still awaiting acknowledgement. Slot value
-     * 0 is empty. Dynamic-memory builds derive this from the per-subscriber
-     * out_q instead, via BrokerNextPacketIdForQueue. */
-    word16  out_inflight[BROKER_MAX_INFLIGHT_PER_SUB];
+     * must not reuse an identifier still awaiting acknowledgement. The QoS is
+     * kept with it so a mismatched acknowledgement (a PUBACK for a QoS 2
+     * delivery, say) cannot free a slot whose PUBREC/PUBCOMP flow is still
+     * running. packet_id 0 marks an empty slot. Dynamic-memory builds derive
+     * this from the per-subscriber out_q instead, via
+     * BrokerNextPacketIdForQueue. */
+    BrokerStaticOutId out_inflight[BROKER_MAX_INFLIGHT_PER_SUB];
 #endif
 #ifndef WOLFMQTT_STATIC_MEMORY
     /* Per-subscriber outbound publish queue. FIFO from head to tail;
