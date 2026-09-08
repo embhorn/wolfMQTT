@@ -1494,6 +1494,17 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_MALFORMED_DATA);
         }
     #endif
+        /* [MQTT-3.1.3-7] A Client that supplies a zero-byte ClientId MUST
+         * also set CleanSession to 1. There is no ClientId for a Server to
+         * key a persistent session on, so [MQTT-3.1.3-8] requires a
+         * conforming Server to answer the pairing with Identifier Rejected.
+         * Refuse to put the packet on the wire instead. MQTT 5.0 section
+         * 3.1.3.1 drops the coupling - a zero-length ClientId asks the
+         * Server to assign one - so the combination stays legal there. */
+        if (str_len == 0 && mc_connect->clean_session == 0 &&
+                mc_connect->protocol_level == MQTT_CONNECT_PROTOCOL_LEVEL_4) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+        }
         remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
     }
     if (mc_connect->enable_lwt) {

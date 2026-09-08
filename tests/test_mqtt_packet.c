@@ -2553,6 +2553,85 @@ TEST(encode_connect_default_password_without_username)
 #endif
 }
 
+/* [MQTT-3.1.3-7] "If the Client supplies a zero-byte ClientId, the Client MUST
+ * also set CleanSession to 1." A conforming Server answers the pairing with
+ * Identifier Rejected [MQTT-3.1.3-8], so the encoder must refuse to build the
+ * packet rather than hand the caller a CONNECT it is not allowed to send. */
+TEST(encode_connect_v311_empty_client_id_without_clean_session_rejected)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "";
+    conn.clean_session = 0;
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+
+/* Positive control: the pairing the spec does allow. Section 3.1.3.1 notes a
+ * Server may assign a unique ClientId when the Client sends a zero-byte one,
+ * and the CleanSession bit is 0x02 in the Connect Flags byte (section 3.1.2.4),
+ * which sits at offset 9 of the CONNECT variable header. */
+TEST(encode_connect_v311_empty_client_id_with_clean_session_accepted)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "";
+    conn.clean_session = 1;
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    /* 0x10 type, 0x0C remaining length, then the 10-byte variable header:
+     * 00 04 'M' 'Q' 'T' 'T' 04 <flags> <keepalive hi> <keepalive lo>. */
+    ASSERT_EQ(MQTT_CONNECT_FLAG_CLEAN_SESSION, (int)tx_buf[9]);
+    /* Followed by the zero-length ClientId: 00 00. */
+    ASSERT_EQ(0, (int)tx_buf[12]);
+    ASSERT_EQ(0, (int)tx_buf[13]);
+}
+
+/* Second positive control: a non-empty ClientId with CleanSession 0 is the
+ * ordinary persistent-session CONNECT and must stay legal, so the guard keys
+ * on the pairing rather than on CleanSession alone. */
+TEST(encode_connect_v311_client_id_without_clean_session_accepted)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.clean_session = 0;
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    ASSERT_EQ(0, (int)tx_buf[9]);
+}
+
+#ifdef WOLFMQTT_V5
+/* MQTT 5.0 section 3.1.3.1 drops the coupling: a zero-length Client Identifier
+ * asks the Server to assign one and carries no Clean Start requirement, so the
+ * v3.1.1 guard must not reach a v5 CONNECT. */
+TEST(encode_connect_v5_empty_client_id_without_clean_session_accepted)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "";
+    conn.clean_session = 0;
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+}
+#endif /* WOLFMQTT_V5 */
+
 TEST(encode_connect_unsupported_protocol_level)
 {
     byte tx_buf[256];
@@ -6599,6 +6678,12 @@ void run_mqtt_packet_tests(void)
     /* MqttEncode_Connect */
     RUN_TEST(encode_connect_password_without_username);
     RUN_TEST(encode_connect_default_password_without_username);
+    RUN_TEST(encode_connect_v311_empty_client_id_without_clean_session_rejected);
+    RUN_TEST(encode_connect_v311_empty_client_id_with_clean_session_accepted);
+    RUN_TEST(encode_connect_v311_client_id_without_clean_session_accepted);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(encode_connect_v5_empty_client_id_without_clean_session_accepted);
+#endif
     RUN_TEST(encode_connect_unsupported_protocol_level);
 #ifdef WOLFMQTT_V5
     RUN_TEST(encode_connect_v5_password_without_username);

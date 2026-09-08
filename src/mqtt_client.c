@@ -2288,6 +2288,22 @@ static int MqttConnect_HasRecvMax(const MqttConnect* mc_connect)
 #endif /* WOLFMQTT_MAX_QOS >= 2 */
 #endif
 
+/* [MQTT-3.1.0-1] After a Network Connection is established by a Client to a
+ * Server, the first Packet sent from the Client to the Server MUST be a
+ * CONNECT Packet. MQTT_CLIENT_FLAG_IS_CONNECTED tracks only the transport, so
+ * the send APIs consult MQTT_CLIENT_FLAG_CONNECT_SENT to refuse a PUBLISH,
+ * SUBSCRIBE, UNSUBSCRIBE, PINGREQ or DISCONNECT that would otherwise become
+ * the first MQTT packet on the wire. A Client need not wait for CONNACK
+ * (section 3.1.4), so this checks only that CONNECT has been sent. */
+static int MqttClient_CheckConnectSent(MqttClient *client)
+{
+    if ((MqttClient_Flags(client, 0, 0) &
+            MQTT_CLIENT_FLAG_CONNECT_SENT) == 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
 int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 {
     int rc;
@@ -2303,6 +2319,17 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
+        /* [MQTT-3.1.0-2] A Client can only send the CONNECT Packet once over a
+         * Network Connection; a Server must treat a second one as a protocol
+         * violation and disconnect. A partially written CONNECT re-enters with
+         * stat.write past MQTT_MSG_BEGIN, so resuming one is unaffected -
+         * only a new handshake attempt on the same transport is refused. The
+         * application must close the Network Connection with
+         * MqttClient_NetDisconnect before connecting again. */
+        if ((MqttClient_Flags(client, 0, 0) &
+                MQTT_CLIENT_FLAG_CONNECT_SENT) != 0) {
+            return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
+        }
     #ifdef WOLFMQTT_V5
         #ifdef WOLFMQTT_MULTITHREAD
         rc = wm_SemLock(&client->lockClient);
@@ -2460,6 +2487,11 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             && client->write.total > 0
         #endif
         ) {
+            /* Part of the CONNECT is already on the wire, so this Network
+             * Connection has had its one CONNECT [MQTT-3.1.0-2] and the other
+             * send APIs are no longer blocked by [MQTT-3.1.0-1]. Resuming this
+             * same write re-enters past MQTT_MSG_BEGIN and is unaffected. */
+            (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
             /* keep send locked and return early.
              * Note: tx_buf still contains credentials until write completes */
             return rc;
@@ -2473,9 +2505,17 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         MqttWriteStop(client, &mc_connect->stat);
 
         if (rc != xfer) {
+            /* Nothing usable reached the peer, so leave the handshake state
+             * clear and let the caller retry on this Network Connection. */
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
             return rc;
         }
+
+        /* CONNECT is on the wire: this Network Connection has had its one
+         * CONNECT [MQTT-3.1.0-2], and the other send APIs are no longer
+         * blocked by [MQTT-3.1.0-1]. A Client need not wait for CONNACK
+         * before sending more packets (section 3.1.4). */
+        (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
 
     #ifdef WOLFMQTT_V5
         /* Enhanced authentication */
@@ -2953,6 +2993,12 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-3.1.0-1] CONNECT must be the first packet on the connection. */
+    rc = MqttClient_CheckConnectSent(client);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+
 #ifdef WOLFMQTT_V5
     /* Use specified protocol version if set */
     publish->protocol_level = client->protocol_level;
@@ -3308,6 +3354,12 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-3.1.0-1] CONNECT must be the first packet on the connection. */
+    rc = MqttClient_CheckConnectSent(client);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+
 #ifdef WOLFMQTT_V5
     /* Use specified protocol version if set */
     subscribe->protocol_level = client->protocol_level;
@@ -3431,6 +3483,12 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
     /* Validate required arguments */
     if (client == NULL || unsubscribe == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
+    }
+
+    /* [MQTT-3.1.0-1] CONNECT must be the first packet on the connection. */
+    rc = MqttClient_CheckConnectSent(client);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
     }
 
 #ifdef WOLFMQTT_V5
@@ -3591,6 +3649,12 @@ int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping)
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
+    /* [MQTT-3.1.0-1] CONNECT must be the first packet on the connection. */
+    rc = MqttClient_CheckConnectSent(client);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+
     if (ping->stat.write == MQTT_MSG_BEGIN) {
         /* Flag write active / lock mutex */
         if ((rc = MqttWriteStart(client, &ping->stat)) != 0) {
@@ -3703,6 +3767,13 @@ int MqttClient_Disconnect_ex(MqttClient *client, MqttDisconnect *p_disconnect)
     if (client == NULL) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
+
+    /* [MQTT-3.1.0-1] CONNECT must be the first packet on the connection. */
+    rc = MqttClient_CheckConnectSent(client);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+
     if (disconnect == NULL) {
         disconnect = &lcl_disconnect;
         XMEMSET(disconnect, 0, sizeof(*disconnect));

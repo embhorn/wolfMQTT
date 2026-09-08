@@ -162,7 +162,16 @@ enum MqttClientFlags {
      * application that schedules its own ping, without changing the keep-alive
      * negotiated with the broker. Set via MqttClient_Flags before connecting.
      * Has no effect when built with WOLFMQTT_NO_TIME. */
-    MQTT_CLIENT_FLAG_NO_AUTO_KEEPALIVE = 0x01 << 4
+    MQTT_CLIENT_FLAG_NO_AUTO_KEEPALIVE = 0x01 << 4,
+    /* A CONNECT has been written on the current Network Connection. Tracks the
+     * MQTT handshake, which MQTT_CLIENT_FLAG_IS_CONNECTED does not: that flag
+     * means only that the transport is up. [MQTT-3.1.0-1] requires CONNECT to
+     * be the first packet a Client sends on a Network Connection and
+     * [MQTT-3.1.0-2] allows only one, so the send APIs consult this flag.
+     * Managed by the library - set by MqttClient_Connect and cleared by
+     * MqttSocket_Connect and MqttSocket_Disconnect. Applications must not set
+     * or clear it through MqttClient_Flags. */
+    MQTT_CLIENT_FLAG_CONNECT_SENT = 0x01 << 5
 };
 /*! \brief      Sets flags in the MqttClient structure. To be used from
                 the application before calling MqttClient_NetConnect.

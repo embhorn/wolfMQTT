@@ -145,6 +145,18 @@ static int test_init_client(void)
     return rc;
 }
 
+/* Declare the precondition the MQTT send APIs require: a CONNECT has already
+ * been written on this Network Connection. [MQTT-3.1.0-1] makes CONNECT the
+ * first packet a Client sends, so MqttClient_Publish, _Subscribe,
+ * _Unsubscribe, _Ping and _Disconnect refuse to put anything on the wire
+ * before it. Tests that exercise those APIs in isolation - without driving a
+ * full handshake through MqttClient_Connect - state that precondition here
+ * rather than relying on the send path not checking it. */
+static void test_client_connect_sent(void)
+{
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
+}
+
 /* ============================================================================
  * MqttClient_Init Tests
  * ============================================================================ */
@@ -512,6 +524,252 @@ static int mock_net_read_canned(void *context, byte* buf, int buf_len,
     XMEMCPY(buf, g_canned_buf + g_canned_pos, n);
     g_canned_pos += n;
     return n;
+}
+
+/* [MQTT-3.1.0-1] "After a Network Connection is established by a Client to a
+ * Server, the first Packet sent from the Client to the Server MUST be a
+ * CONNECT Packet." MQTT_CLIENT_FLAG_IS_CONNECTED tracks only the transport, so
+ * an application that calls MqttClient_NetConnect and then publishes used to
+ * put a PUBLISH on the wire as the first MQTT packet. Nothing may reach the
+ * network before CONNECT. */
+TEST(publish_before_connect_rejected)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* Transport up, MQTT handshake not started - what NetConnect leaves. */
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_0;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+
+    rc = MqttClient_Publish(&test_client, &publish);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
+/* Same rule for the other client-to-server Control Packets. */
+TEST(subscribe_before_connect_rejected)
+{
+    int rc;
+    MqttSubscribe subscribe;
+    MqttTopic topic;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    XMEMSET(&subscribe, 0, sizeof(subscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    topic.qos = MQTT_QOS_0;
+    subscribe.packet_id = 1;
+    subscribe.topic_count = 1;
+    subscribe.topics = &topic;
+
+    rc = MqttClient_Subscribe(&test_client, &subscribe);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
+TEST(unsubscribe_before_connect_rejected)
+{
+    int rc;
+    MqttUnsubscribe unsubscribe;
+    MqttTopic topic;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    XMEMSET(&unsubscribe, 0, sizeof(unsubscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "test/topic";
+    unsubscribe.packet_id = 1;
+    unsubscribe.topic_count = 1;
+    unsubscribe.topics = &topic;
+
+    rc = MqttClient_Unsubscribe(&test_client, &unsubscribe);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
+TEST(ping_before_connect_rejected)
+{
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    rc = MqttClient_Ping(&test_client);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
+TEST(disconnect_before_connect_rejected)
+{
+    int rc;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read;
+
+    rc = MqttClient_Disconnect(&test_client);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
+/* Positive control for the whole guard: after a real CONNECT the same publish
+ * reaches the wire, so the check gates on handshake state and not on the
+ * publish itself. */
+TEST(publish_after_connect_allowed)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+    /* CONNACK v3.1.1: type=0x20, remain=2, flags=0x00, return_code=0x00. */
+    static const byte connack[] = { 0x20, 0x02, 0x00, 0x00 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    g_frames_written = 0;
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_0;
+    publish.topic_name = "test/topic";
+    publish.buffer = payload;
+    publish.total_len = (word32)(sizeof(payload) - 1);
+    publish.buffer_len = publish.total_len;
+
+    rc = MqttClient_Publish(&test_client, &publish);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_frames_written);
+}
+
+/* [MQTT-3.1.0-2] "A Client can only send the CONNECT Packet once over a
+ * Network Connection. The Server MUST process a second CONNECT Packet sent
+ * from a Client as a protocol violation and disconnect the Client." A second
+ * MqttClient_Connect on the same transport must be refused before anything is
+ * encoded, and closing the Network Connection must make a new one legal again.
+ */
+TEST(second_connect_on_same_network_connection_rejected)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    static const byte connack[] = { 0x20, 0x02, 0x00, 0x00 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    test_net.disconnect = mock_net_disconnect;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    g_frames_written = 0;
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* Second handshake attempt on the same transport, fresh CONNECT object. */
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MqttClient_Connect(&test_client, &connect);
+
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(1, g_frames_written); /* nothing new reached the wire */
+
+    /* Closing the Network Connection starts a new one, where CONNECT is legal
+     * again - the sequence a reconnecting application must follow. */
+    rc = MqttClient_NetDisconnect(&test_client);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    g_canned_pos = 0;
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(2, g_frames_written);
 }
 
 /* A broker that accepts the connection returns a CONNACK whose return code is
@@ -887,7 +1145,11 @@ TEST(auth_with_connect_method_allowed)
     MqttClient_PropsFree(auth.props);
 
     /* Reconnect without the property: the negotiation does not carry over, so
-     * the same AUTH must now be refused before anything reaches the wire. */
+     * the same AUTH must now be refused before anything reaches the wire.
+     * [MQTT-3.1.0-2] allows only one CONNECT per Network Connection, so the
+     * old one is closed first - the same sequence an application must use. */
+    rc = MqttClient_NetDisconnect(&test_client);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     XMEMSET(&auth, 0, sizeof(auth));
     rc = run_connect_v5_with_auth_method(0);
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
@@ -1045,6 +1307,7 @@ TEST(publish_qos1_v5_receive_max_quota_exhausted_rejects_before_send)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 0; /* quota exhausted */
 
@@ -1079,6 +1342,7 @@ TEST(publish_qos1_v5_receive_max_quota_decrements_once_and_replenishes)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 5;
 
@@ -1171,6 +1435,7 @@ TEST(cancel_message_reuse_does_not_bypass_recv_quota)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max_negotiated = 1;
     test_client.server_recv_max = 0; /* the one unit is on the wire */
@@ -1246,6 +1511,7 @@ TEST(publish_qos1_v5_write_failure_restores_recv_quota)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max_negotiated = 5;
     test_client.server_recv_max = 5;
@@ -1479,6 +1745,7 @@ TEST(publish_v5_topic_alias_exceeds_max_rejected)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.topic_alias_max = 5; /* server accepts alias values 1..5 */
 
@@ -1517,6 +1784,7 @@ TEST(publish_v5_topic_alias_zero_rejected)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.topic_alias_max = 5;
 
@@ -1557,6 +1825,7 @@ TEST(publish_v5_subscription_id_rejected)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
 
     XMEMSET(&publish, 0, sizeof(publish));
@@ -1597,6 +1866,7 @@ TEST(publish_v5_oversized_packet_rejected_before_write)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     /* Larger than any single tx_buf-sized fragment (<=256), smaller than the
      * whole PUBLISH (~417 bytes). */
@@ -1635,6 +1905,7 @@ TEST(publish_v5_within_max_packet_size_allowed)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.packet_sz_max = 1000; /* comfortably above the ~417-byte packet */
 
@@ -1758,6 +2029,7 @@ TEST(subscribe_broker_rejection_returns_subscribe_rejected)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
@@ -1802,6 +2074,7 @@ TEST(unsubscribe_broker_rejection_returns_unsubscribe_rejected)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
 
     test_net.write = mock_net_write_accept;
@@ -1841,6 +2114,7 @@ TEST(unsubscribe_too_few_reason_codes_is_malformed)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     (void)MqttClient_Flags(&test_client, 0,
         MQTT_CLIENT_FLAG_IS_CONNECTED);
@@ -1884,6 +2158,7 @@ TEST(unsubscribe_too_many_reason_codes_is_malformed)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     (void)MqttClient_Flags(&test_client, 0,
         MQTT_CLIENT_FLAG_IS_CONNECTED);
@@ -1993,6 +2268,7 @@ TEST(ping_response_timeout_disconnects_network)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     (void)MqttClient_Flags(&test_client, 0, MQTT_CLIENT_FLAG_IS_CONNECTED);
     g_disconnect_calls = 0;
@@ -2143,6 +2419,7 @@ TEST(ping_timeout_waits_for_concurrent_writer)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     XMEMSET(&race, 0, sizeof(race));
     ASSERT_EQ(0, pthread_mutex_init(&race.mutex, NULL));
     ASSERT_EQ(0, pthread_cond_init(&race.cond, NULL));
@@ -2329,6 +2606,7 @@ TEST(publish_stream_cb_final_chunk_no_overrun)
 
     rc = test_init_client(); /* tx_buf_len = TEST_TX_BUF_SIZE (256) */
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     pub_stream_wire_len = 0;
     XMEMSET(pub_stream_wire, 0, sizeof(pub_stream_wire));
@@ -2374,6 +2652,7 @@ TEST(publish_stream_cb_multifill_full_payload)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     pub_stream_wire_len = 0;
     pub_stream_hdr_len = 0;
@@ -2413,6 +2692,7 @@ TEST(publish_stream_cb_overreturn_clamped_to_total)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     pub_stream_wire_len = 0;
     pub_stream_hdr_len = 0;
@@ -2475,6 +2755,7 @@ TEST(publish_stream_cb_nonblock_resume_no_tail_drop)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     pub_stream_wire_len = 0;
     pub_stream_hdr_len = 0;
@@ -2521,6 +2802,7 @@ static int run_publish_with_canned_resp(MqttPublish* publish,
     if (rc != MQTT_CODE_SUCCESS) {
         return rc;
     }
+    test_client_connect_sent();
     test_client.protocol_level = proto_level;
 
     g_pubrel_written = 0;
@@ -2764,6 +3046,7 @@ TEST(publish_qos2_v5_pubrec_reject_restores_receive_max)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3106,6 +3389,7 @@ TEST(publish_qos2_v5_pubrec_rejection_multithread_reader)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
 
     g_pubrel_written = 0;
@@ -3160,6 +3444,7 @@ TEST(publish_qos2_v5_pubrec_state_multithread_reader)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_net.write = mock_net_write_accept;
     test_net.read = mock_net_read_canned;
@@ -3227,6 +3512,7 @@ TEST(publish_writeonly_v5_receive_max_quota_exhausted_rejects)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 0; /* quota exhausted */
 
@@ -3263,6 +3549,7 @@ TEST(publish_writeonly_v5_receive_max_released_on_puback)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3319,6 +3606,7 @@ TEST(publish_writeonly_v5_receive_max_released_on_pubrec_reject)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3393,6 +3681,7 @@ TEST(publish_writeonly_v5_no_dangling_pendresp_on_success)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3434,6 +3723,7 @@ TEST(publish_writeonly_v5_cancel_holds_receive_max)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3483,6 +3773,7 @@ TEST(disconnect_clears_recv_quota_ownership)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
@@ -3511,7 +3802,10 @@ TEST(disconnect_clears_recv_quota_ownership)
     ASSERT_EQ(0, (int)publish.stat.recvQuotaHeld);
 
     /* Stand in for the reconnect that re-negotiates the quota, then reuse the
-     * same object: it must reserve again rather than ride the stale flag. */
+     * same object: it must reserve again rather than ride the stale flag. The
+     * NetDisconnect above ended the Network Connection, so the new one needs
+     * its own CONNECT before any publish [MQTT-3.1.0-1]. */
+    test_client_connect_sent();
     test_client.server_recv_max = 1;
     test_client.server_recv_max_negotiated = 1;
     publish.stat.write = MQTT_MSG_BEGIN;
@@ -3549,6 +3843,7 @@ TEST(publish_writeonly_rejects_duplicate_in_flight_packet_id)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     /* Mock writes accept everything so the publish state machine reaches
      * MQTT_MSG_WAIT and returns MQTT_CODE_CONTINUE while the pendResp is
@@ -3638,6 +3933,7 @@ TEST(subscribe_in_flight_blocks_publish_with_same_packet_id)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     test_net.write = mock_net_write_accept;
     test_net.read = mock_net_read_continue;
@@ -4361,6 +4657,10 @@ TEST(wait_message_auto_pings_on_keepalive_deadline)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4397,6 +4697,10 @@ TEST(wait_message_no_autoping_when_keepalive_zero)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4417,6 +4721,10 @@ TEST(wait_message_no_autoping_when_flag_disables)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4450,6 +4758,10 @@ TEST(wait_message_auto_pings_before_full_interval_with_margin)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4475,6 +4787,10 @@ TEST(wait_message_no_autoping_when_link_recently_active)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4498,6 +4814,7 @@ TEST(packet_write_refreshes_last_tx_time)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4526,6 +4843,7 @@ TEST(packet_write_skips_last_tx_time_when_keepalive_zero)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4550,6 +4868,10 @@ TEST(wait_message_no_autoping_during_partial_read)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4577,6 +4899,10 @@ TEST(wait_message_no_autoping_during_partial_payload)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4607,6 +4933,10 @@ TEST(wait_message_no_autoping_when_read_active)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4639,6 +4969,10 @@ TEST(wait_message_resumes_inflight_ping)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4670,6 +5004,10 @@ TEST(wait_message_nonblock_returns_continue_for_deferred_ping)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The keep-alive PINGREQ the wait path injects is a Control Packet
+     * like any other, so it needs the post-CONNECT state [MQTT-3.1.0-1].
+     * In practice keep_alive_sec is only armed by an accepted CONNACK. */
+    test_client_connect_sent();
 
     g_pingreq_writes = 0;
     test_net.write = mock_net_write_count_ping;
@@ -4954,6 +5292,13 @@ void run_mqtt_client_tests(void)
     RUN_TEST(connect_null_connect);
     RUN_TEST(connect_both_null);
     RUN_TEST(connect_with_mock_network);
+    RUN_TEST(publish_before_connect_rejected);
+    RUN_TEST(subscribe_before_connect_rejected);
+    RUN_TEST(unsubscribe_before_connect_rejected);
+    RUN_TEST(ping_before_connect_rejected);
+    RUN_TEST(disconnect_before_connect_rejected);
+    RUN_TEST(publish_after_connect_allowed);
+    RUN_TEST(second_connect_on_same_network_connection_rejected);
     RUN_TEST(connect_clears_tx_buf_credentials);
     RUN_TEST(connect_accepted_connack_returns_success);
     RUN_TEST(connect_clean_session_present_mismatch_refused);
