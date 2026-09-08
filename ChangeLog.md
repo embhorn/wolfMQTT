@@ -103,6 +103,11 @@
       Dynamic-memory builds already derived this from the per-subscriber
       queue. A delivery is skipped rather than sent with a reused identifier
       when all BROKER_MAX_INFLIGHT_PER_SUB slots are outstanding (#614)
+    - The QoS acknowledgement for a received PUBLISH is now staged on the wait
+      object rather than in a field shared by every reader. Another thread
+      completing its own read could previously overwrite it between the read
+      lock being dropped and the send lock being taken, sending the later
+      Packet Identifier twice and never the earlier one [MQTT-4.6.0-2] (#608)
     - The client's inbound QoS 2 de-duplication table is now bound to the
       ClientId that populated it. Reusing one `MqttClient` under a new
       ClientId no longer inherits the previous Session's pending packet ids

@@ -385,6 +385,10 @@ static int g_last_ack_written;
  * the 4..7 range that g_last_ack_written tracks. */
 static int g_frames_written;
 
+/* Every PUBLISH-response packet id written to the wire, in order. */
+static int g_ack_ids[8];
+static int g_ack_id_count;
+
 /* Packet id carried by the most recent PUBLISH-response frame written to the
  * wire. For a v3.1.1 ack the two-byte id sits right after the fixed header, so a
  * test can confirm the client echoed the id of the PUBLISH it is acknowledging. */
@@ -423,6 +427,12 @@ static int mock_net_write_accept(void *context, const byte* buf, int buf_len,
             g_last_ack_written = ack_type;
             if (buf_len >= 4) {
                 g_last_ack_id = (buf[2] << 8) | buf[3];
+                /* Keep the full sequence so a test can check [MQTT-4.6.0-2]
+                 * ordering, not just the last value. */
+                if (g_ack_id_count <
+                        (int)(sizeof(g_ack_ids) / sizeof(g_ack_ids[0]))) {
+                    g_ack_ids[g_ack_id_count++] = g_last_ack_id;
+                }
             }
         }
     }
@@ -2609,6 +2619,83 @@ TEST(net_disconnect_frees_in_flight_packet_ids)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(2, g_frames_written);
 }
+
+/* [MQTT-4.6.0-2] "It MUST send PUBACK packets in the order in which the
+ * corresponding PUBLISH packets were received". The acknowledgement used to be
+ * staged in client->packetAck, a field every reader shares. A second thread
+ * finishing its own PUBLISH read overwrites it in the window between the first
+ * thread dropping the read lock and taking the send lock, so the first ack
+ * went out carrying the second id and the first id was never acknowledged.
+ *
+ * The window is reproduced deterministically rather than raced: the ack write
+ * is deferred (as it is when another write holds the send lock), the shared
+ * field is then overwritten the way a second reader would, and the deferred
+ * ack is flushed. It must still carry the id it was staged with.
+ */
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    WOLFMQTT_MAX_QOS >= 1
+static int mock_msg_cb_accept(MqttClient* client, MqttMessage* msg,
+    byte msg_new, byte msg_done)
+{
+    (void)client; (void)msg; (void)msg_new; (void)msg_done;
+    return MQTT_CODE_SUCCESS;
+}
+
+TEST(wait_message_puback_survives_shared_ack_overwrite)
+{
+    int rc;
+    int i;
+    /* v3.1.1 QoS 1 PUBLISH: topic "a", packet id 1, payload "h". */
+    static const byte publish_id1[] = {
+        0x32, 0x06, 0x00, 0x01, 'a', 0x00, 0x01, 'h'
+    };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    test_client.msg_cb = mock_msg_cb_accept;
+
+    g_ack_id_count = 0;
+    g_last_ack_id = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, publish_id1, sizeof(publish_id1));
+    g_canned_len = (int)sizeof(publish_id1);
+    g_canned_pos = 0;
+
+    /* An in-progress write makes MqttWriteStart defer, so the PUBLISH is read
+     * and its ack staged but not yet encoded - exactly the window. */
+    test_client.write.isActive = 1;
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH_ACK,
+        (int)test_client.msg.stat.ackPacketType);
+    ASSERT_EQ(1, (int)test_client.msg.stat.ackPacketId);
+    ASSERT_EQ(0, g_ack_id_count); /* nothing on the wire yet */
+
+    /* A second reader completing its own PUBLISH read replaces the shared
+     * field. Pre-fix this is the value the encoder would have used. */
+    XMEMSET(&test_client.packetAck, 0, sizeof(test_client.packetAck));
+    test_client.packetAck.packet_type = MQTT_PACKET_TYPE_PUBLISH_ACK;
+    test_client.packetAck.packet_id = 0x2222;
+
+    /* Release the write path and let the deferred ack go out. */
+    test_client.write.isActive = 0;
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, TEST_CMD_TIMEOUT_MS);
+    }
+
+    /* The ack carries the id it was staged with, not the overwritten one. */
+    ASSERT_TRUE(g_ack_id_count >= 1);
+    ASSERT_EQ(1, g_ack_ids[0]);
+}
+#endif /* WOLFMQTT_MULTITHREAD && WOLFMQTT_NONBLOCK && WOLFMQTT_MAX_QOS >= 1 */
 
 /* ============================================================================
  * MqttClient_Disconnect Tests
@@ -5833,6 +5920,10 @@ void run_mqtt_client_tests(void)
     RUN_TEST(connect_frees_in_flight_packet_ids);
     RUN_TEST(send_inflight_table_full_still_allows_new_packet_id);
     RUN_TEST(net_disconnect_frees_in_flight_packet_ids);
+#if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
+    WOLFMQTT_MAX_QOS >= 1
+    RUN_TEST(wait_message_puback_survives_shared_ack_overwrite);
+#endif
     RUN_TEST(disconnect_null_client);
 
     /* MqttClient_GetProtocolVersion tests */

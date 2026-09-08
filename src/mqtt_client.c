@@ -2087,6 +2087,22 @@ wait_again:
             #endif
             #endif
 
+                /* Stage the acknowledgement on this wait object as well.
+                 * client->packetAck above is shared by every reader, so a
+                 * thread finishing its own PUBLISH read can overwrite it in
+                 * the window between this read lock being dropped and the
+                 * send lock being taken below, sending the later ack twice
+                 * and never the earlier one. [MQTT-4.6.0-2] requires PUBACKs
+                 * to be sent in the order their PUBLISHes were received, so
+                 * the encode reads these per-object fields instead. */
+                mms_stat->ackPacketType = resp.packet_type;
+                mms_stat->ackPacketId = resp.packet_id;
+            #ifdef WOLFMQTT_V5
+                mms_stat->ackReasonCode = resp.reason_code;
+                mms_stat->ackProps = resp.props;
+                mms_stat->ackProtocolLevel = client->protocol_level;
+            #endif
+
                 /* if we get here, then we are sending an ACK */
                 mms_stat->read = MQTT_MSG_ACK;
                 mms_stat->ack = MQTT_MSG_WAIT;
@@ -2146,13 +2162,27 @@ wait_again:
 
         case MQTT_MSG_ACK:
         {
+            /* Rebuild the response from this wait object's staged fields, not
+             * from the shared client->packetAck another reader may have
+             * replaced since [MQTT-4.6.0-2]. */
+            MqttPublishResp ackResp;
+
+            XMEMSET(&ackResp, 0, sizeof(ackResp));
+            ackResp.packet_type = mms_stat->ackPacketType;
+            ackResp.packet_id = mms_stat->ackPacketId;
+        #ifdef WOLFMQTT_V5
+            ackResp.reason_code = mms_stat->ackReasonCode;
+            ackResp.props = mms_stat->ackProps;
+            ackResp.protocol_level = mms_stat->ackProtocolLevel;
+        #endif
+
             /* send ack */
             rc = MqttEncode_PublishResp(client->tx_buf, client->tx_buf_len,
-                client->packetAck.packet_type, &client->packetAck);
+                ackResp.packet_type, &ackResp);
         #ifdef WOLFMQTT_DEBUG_CLIENT
             PRINTF("MqttEncode_PublishResp: Len %d, Type %s (%d), ID %d",
-                rc, MqttPacket_TypeDesc(client->packetAck.packet_type),
-                    client->packetAck.packet_type, client->packetAck.packet_id);
+                rc, MqttPacket_TypeDesc(ackResp.packet_type),
+                    ackResp.packet_type, ackResp.packet_id);
         #endif
             if (rc < 0) {
                 MqttWriteStop(client, mms_stat);
@@ -2187,6 +2217,8 @@ wait_again:
                 rc = MQTT_CODE_SUCCESS; /* success */
             }
 
+            /* The staged acknowledgement is spent. */
+            mms_stat->ackPacketType = MQTT_PACKET_TYPE_RESERVED;
             mms_stat->ack = MQTT_MSG_BEGIN; /* reset write state */
             break;
         }

@@ -341,6 +341,22 @@ typedef struct _MqttMsgStat {
      * while the owning thread writes isReadActive/isWriteActive outside that
      * lock; sharing a byte would make those a racy read-modify-write. */
     byte recvQuotaHeld;
+
+    /* QoS acknowledgement staged for this wait object while its PUBLISH was
+     * read, encoded later once the send lock is held. [MQTT-4.6.0-2] requires
+     * PUBACKs to go out in the order their PUBLISHes arrived, so the response
+     * cannot sit in a field shared by every reader: another thread finishing
+     * its own read would overwrite it in the window between the read lock
+     * being dropped and the send lock being taken. Kept as the encodable
+     * fields rather than a whole MqttPublishResp, which embeds this struct.
+     * ackPacketType is MQTT_PACKET_TYPE_RESERVED when nothing is staged. */
+    word16 ackPacketId;
+    byte   ackPacketType;
+#ifdef WOLFMQTT_V5
+    byte   ackReasonCode;
+    byte   ackProtocolLevel;
+    MqttProp* ackProps;
+#endif
 } MqttMsgStat;
 
 #ifdef WOLFMQTT_MULTITHREAD
