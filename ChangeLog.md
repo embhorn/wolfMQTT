@@ -66,6 +66,12 @@
     - `MqttEncode_Connect` rejects a zero-byte ClientId paired with
       `clean_session` 0 for MQTT v3.1.1 [MQTT-3.1.3-7]. MQTT v5.0 drops the
       coupling and still allows it (#585)
+    - `MqttConnect` gains `password_len`. [MQTT-3.1.3.5] defines the Password
+      as Binary Data, which may contain 0x00, but the encoder measured it with
+      `XSTRLEN` and truncated at the first one. Set `password_len` to send
+      binary password bytes verbatim; leaving it 0 keeps the previous
+      NUL-terminated behaviour, so existing callers are unaffected. The field
+      is at the end of the struct, so layouts are unchanged (#588)
 
 * Fixes
     - The v3.1.1 `CONNACK` decoder accepted a Remaining Length above 2 and
@@ -91,6 +97,16 @@
     - WebSocket: both receive callbacks now close the connection on a
       non-binary data frame instead of feeding its payload to the MQTT parser
       [MQTT-6.0.0-1] (#610)
+    - Broker: static-memory fan-out now tracks the outbound QoS 1/2 Packet
+      Identifiers each subscriber has not yet acknowledged, so a new PUBLISH
+      cannot reuse one still awaiting its PUBACK or PUBCOMP [MQTT-2.3.1-4].
+      Dynamic-memory builds already derived this from the per-subscriber
+      queue. A delivery is skipped rather than sent with a reused identifier
+      when all BROKER_MAX_INFLIGHT_PER_SUB slots are outstanding (#614)
+    - The client's inbound QoS 2 de-duplication table is now bound to the
+      ClientId that populated it. Reusing one `MqttClient` under a new
+      ClientId no longer inherits the previous Session's pending packet ids
+      when the server answers Session Present = 1 [MQTT-3.1.3-2] (#595)
 
 ### v2.1.0 (07/02/2026)
 Release 2.1.0 has been developed according to wolfSSL's development and QA
