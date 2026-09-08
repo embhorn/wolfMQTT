@@ -364,6 +364,11 @@ typedef struct _MqttClient {
      * with PUBREC but not delivered a second time [MQTT-4.3.3-10]. Slot value 0
      * is empty; a QoS 2 packet id is never 0. */
     word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
+    /* Fingerprint of the ClientId that populated recv_qos2_pending.
+     * [MQTT-3.1.3-2] makes the ClientId identify the Session state, so a
+     * Session Present answer for a different ClientId must not inherit the
+     * previous one's pending ids. 0 means no Session has been recorded. */
+    word32 session_client_id_hash;
 #endif
 
     /* Outbound Packet Identifiers written on the current Network Connection

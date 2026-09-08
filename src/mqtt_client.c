@@ -501,6 +501,26 @@ static void MqttClient_RecvQuotaRelease(MqttClient* client, MqttMsgStat* stat)
 #endif /* WOLFMQTT_V5 */
 
 #if WOLFMQTT_MAX_QOS >= 2
+/* Fingerprint the ClientId so the inbound QoS 2 table can tell whether a
+ * resumed Session belongs to the same one. A collision leaves stale entries in
+ * place, which is exactly the behaviour before this check existed, so the
+ * cheap hash only ever improves on it. Never returns 0; that value marks
+ * "no Session recorded". */
+static word32 MqttClient_ClientIdHash(const char* client_id)
+{
+    word32 hash = 2166136261U; /* FNV-1a 32-bit offset basis */
+    const byte* p;
+
+    if (client_id == NULL) {
+        return 1;
+    }
+    for (p = (const byte*)client_id; *p != '\0'; p++) {
+        hash ^= (word32)*p;
+        hash *= 16777619U; /* FNV-1a 32-bit prime */
+    }
+    return (hash == 0) ? 1 : hash;
+}
+
 /* Inbound QoS 2 de-duplication. A subscribing client that has delivered a
  * QoS 2 PUBLISH to the application and answered with PUBREC records its packet
  * id until the matching PUBREL arrives, so a retransmitted PUBLISH is
@@ -2873,10 +2893,18 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
      * pending packet ids so they cannot suppress a new inbound QoS 2 PUBLISH
      * that reuses one [MQTT-4.3.3-10]. Packet ids also restart per connection,
      * so a fresh session must start with an empty table. */
-    if (rc == MQTT_CODE_SUCCESS &&
-            !(mc_connect->ack.flags & MQTT_CONNECT_ACK_FLAG_SESSION_PRESENT)) {
-        XMEMSET(client->recv_qos2_pending, 0,
-            sizeof(client->recv_qos2_pending));
+    if (rc == MQTT_CODE_SUCCESS) {
+        word32 id_hash = MqttClient_ClientIdHash(mc_connect->client_id);
+
+        /* [MQTT-3.1.3-2] the ClientId identifies the Session state, so a
+         * Session Present answer for a different ClientId is a different
+         * Session and must not inherit the previous one's pending ids. */
+        if (!(mc_connect->ack.flags & MQTT_CONNECT_ACK_FLAG_SESSION_PRESENT) ||
+                id_hash != client->session_client_id_hash) {
+            XMEMSET(client->recv_qos2_pending, 0,
+                sizeof(client->recv_qos2_pending));
+        }
+        client->session_client_id_hash = id_hash;
     }
 #endif
 

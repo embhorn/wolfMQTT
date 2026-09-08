@@ -3501,6 +3501,37 @@ TEST(publish_qos2_v5_pubrec_reject_restores_receive_max)
  * Session Present = 1) keeps its inbound QoS 2 dedup state across reconnect, so
  * a server retransmit still awaiting PUBREL is not delivered to the application
  * a second time. */
+/* Drive one CONNECT to completion against a canned CONNACK carrying the given
+ * Session Present bit, so a test can establish which ClientId owns the
+ * client's Session state before manipulating it. */
+static int run_connect_client_id(MqttConnect* connect, const char* client_id,
+    int session_present)
+{
+    int rc;
+    int i;
+    byte connack[4];
+
+    connack[0] = 0x20;
+    connack[1] = 0x02;
+    connack[2] = (byte)(session_present ? 0x01 : 0x00);
+    connack[3] = 0x00;
+
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(connect, 0, sizeof(*connect));
+    connect->keep_alive_sec = 60;
+    connect->clean_session = (byte)(session_present ? 0 : 1);
+    connect->client_id = client_id;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, connect);
+    }
+    return rc;
+}
+
 TEST(connect_clean0_preserves_qos2_dedup)
 {
     int rc;
@@ -3512,11 +3543,20 @@ TEST(connect_clean0_preserves_qos2_dedup)
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
-    /* A prior connection left an inbound QoS 2 id awaiting PUBREL. */
-    test_client.recv_qos2_pending[0] = 9;
 
     test_net.write = mock_net_write_accept;
     test_net.read = mock_net_read_canned;
+    test_net.disconnect = mock_net_disconnect;
+
+    /* First connection under this ClientId, so the dedup table below belongs
+     * to the Session the reconnect resumes [MQTT-3.1.3-2]. */
+    rc = run_connect_client_id(&connect, "test_client", 0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    /* That connection left an inbound QoS 2 id awaiting PUBREL. */
+    test_client.recv_qos2_pending[0] = 9;
+
     XMEMCPY(g_canned_buf, connack, sizeof(connack));
     g_canned_len = (int)sizeof(connack);
     g_canned_pos = 0;
@@ -3532,6 +3572,50 @@ TEST(connect_clean0_preserves_qos2_dedup)
     }
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(9, test_client.recv_qos2_pending[0]);
+}
+
+/* [MQTT-3.1.3-2] the ClientId identifies the Session state. Reusing one
+ * MqttClient object under a new ClientId must not let the previous Session's
+ * pending QoS 2 ids suppress delivery for the new one, even when the server
+ * answers Session Present = 1 for the new ClientId. */
+TEST(connect_clientid_change_clears_qos2_dedup)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    /* v3.1.1 CONNACK: Session Present = 1 (resume), accepted. */
+    static const byte connack[] = { 0x20, 0x02, 0x01, 0x00 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    test_net.disconnect = mock_net_disconnect;
+
+    rc = run_connect_client_id(&connect, "client_A", 0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    /* Session state left behind by ClientId "client_A". */
+    test_client.recv_qos2_pending[0] = 9;
+
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 0;
+    connect.client_id = "client_B";
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(0, test_client.recv_qos2_pending[0]);
 }
 
 /* Clean Start = 1 clears the inbound QoS 2 dedup state, since packet ids
@@ -5796,6 +5880,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_qos2_v5_pubrec_rejection_returns_publish_rejected);
     RUN_TEST(publish_qos2_v5_pubrec_reject_restores_receive_max);
     RUN_TEST(connect_clean0_preserves_qos2_dedup);
+    RUN_TEST(connect_clientid_change_clears_qos2_dedup);
     RUN_TEST(connect_clean1_clears_qos2_dedup);
     RUN_TEST(connect_resume_declined_clears_qos2_dedup);
     RUN_TEST(connect_v5_advertises_receive_max);
