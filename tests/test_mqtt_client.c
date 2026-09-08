@@ -2477,6 +2477,106 @@ TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected)
     ASSERT_EQ(1, g_frames_written);
 }
 
+/* A new handshake starts a fresh identifier space, so reservations left over
+ * from a dead connection must not refuse a reuse on the new one. This covers
+ * the reconnect path an application takes when the previous connection died
+ * without MqttClient_NetDisconnect: MqttClient_WaitType clears
+ * MQTT_CLIENT_FLAG_IS_CONNECTED on a fatal error, the application calls
+ * MqttClient_NetConnect (which clears MQTT_CLIENT_FLAG_CONNECT_SENT) and then
+ * MqttClient_Connect. Guards the reset against being compiled out. */
+TEST(connect_frees_in_flight_packet_ids)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+    /* CONNACK v3.1.1: type=0x20, remain=2, flags=0x00, return_code=0x00. */
+    static const byte connack[] = { 0x20, 0x02, 0x00, 0x00 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* Stand in for the transport being re-established without a
+     * MqttClient_NetDisconnect: only the handshake flag is cleared. */
+    (void)MqttClient_Flags(&test_client, MQTT_CLIENT_FLAG_CONNECT_SENT, 0);
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 1;
+    connect.client_id = "test_client";
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 10 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* The identifier belonged to the previous connection, so it is free. */
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+}
+
+/* Past MQTT_MAX_SEND_INFLIGHT the table cannot record any more identifiers, so
+ * the collision check is best effort by design: the send is allowed rather
+ * than refused, since an application may legitimately keep more than that many
+ * packets in flight. Pins that contract so a later change to fail closed is a
+ * deliberate one. */
+TEST(send_inflight_table_full_still_allows_new_packet_id)
+{
+    int rc;
+    int i;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    /* Receive Maximum would otherwise cap in-flight publishes first. */
+    test_client.server_recv_max = 65535;
+    test_client.server_recv_max_negotiated = 65535;
+#endif
+
+    /* Fill every slot with a distinct unacknowledged identifier. */
+    for (i = 0; i < MQTT_MAX_SEND_INFLIGHT; i++) {
+        init_qos_publish(&publish, MQTT_QOS_1, (word16)(i + 1), "sensor/temp",
+            payload, (word32)(sizeof(payload) - 1));
+        rc = run_publish_unacked(&publish);
+        ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    }
+
+    /* One more distinct identifier goes untracked but is still sent. */
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1,
+        (word16)(MQTT_MAX_SEND_INFLIGHT + 1), "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+}
+
 /* The identifiers were in use on one Network Connection only; closing it
  * clears them, since the client keeps no outbound session state across one. */
 TEST(net_disconnect_frees_in_flight_packet_ids)
@@ -5646,6 +5746,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_qos1_packet_id_reusable_after_puback);
     RUN_TEST(subscribe_reuse_packet_id_before_suback_rejected);
     RUN_TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected);
+    RUN_TEST(connect_frees_in_flight_packet_ids);
+    RUN_TEST(send_inflight_table_full_still_allows_new_packet_id);
     RUN_TEST(net_disconnect_frees_in_flight_packet_ids);
     RUN_TEST(disconnect_null_client);
 

@@ -2155,6 +2155,9 @@ static int BrokerClient_DrainOutQueue(BrokerClient* bc)
                  * on the next reconnect. Subsequent writes on the
                  * same dead socket would just stack more errors, so
                  * stop the drain here. */
+                WBLOG_ERR(bc->broker,
+                    "broker: drain write failed sock=%d topic=%s rc=%d",
+                    (int)bc->sock, BrokerLog_Sanitize(cur->topic), wr_rc);
                 if (bc->client.write.pos > 0 && cur->qos > MQTT_QOS_0) {
                     /* Part of this PUBLISH did reach the subscriber before
                      * the error - a blocking write loop leaves write.pos at
@@ -2189,9 +2192,6 @@ static int BrokerClient_DrainOutQueue(BrokerClient* bc)
                     bc->out_q_count--;
                     BrokerOutPub_Free(free_me);
                 }
-                WBLOG_ERR(bc->broker,
-                    "broker: drain write failed sock=%d topic=%s rc=%d",
-                    (int)bc->sock, BrokerLog_Sanitize(cur->topic), wr_rc);
                 return (wr_rc < 0) ? wr_rc : MQTT_CODE_ERROR_NETWORK;
             }
         }

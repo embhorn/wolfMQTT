@@ -447,8 +447,12 @@ WOLFMQTT_API int MqttClient_SetPropertyCallback(
  *  \return     MQTT_CODE_SUCCESS if the broker accepted the connection,
                 MQTT_CODE_ERROR_CONNECT_REFUSED if the broker returned a
                 non-zero CONNACK return_code (check
-                connect->ack.return_code for the specific reason), or
-                another MQTT_CODE_ERROR_* for transport/protocol failures
+                connect->ack.return_code for the specific reason),
+                MQTT_CODE_ERROR_STAT if a CONNECT has already been sent on
+                this Network Connection - close it with
+                MqttClient_NetDisconnect before connecting again
+                [MQTT-3.1.0-2] - or another MQTT_CODE_ERROR_* for
+                transport/protocol failures
                 (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Connect(
@@ -477,8 +481,12 @@ WOLFMQTT_API int MqttClient_Connect(
                 MQTT_CODE_ERROR_SERVER_PROP if the request violates a
                 CONNACK-advertised v5 server property before sending (QoS above
                 Maximum QoS, Retain unavailable, Topic Alias above the server
-                maximum, or Receive Maximum quota exhausted), or
-                MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
+                maximum, or Receive Maximum quota exhausted),
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                MQTT_CODE_ERROR_PACKET_ID if the Packet Identifier is still
+                awaiting its acknowledgement [MQTT-2.3.1-2],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
     \sa         MqttClient_Publish_WriteOnly
     \sa         MqttClient_Publish_ex
  */
@@ -541,8 +549,12 @@ WOLFMQTT_API int MqttClient_Publish_ex(
                 >= 0x80 is NOT detected on this path and the publish appears
                 successful. Use MqttClient_Publish/_ex when reliable v5
                 broker-rejection detection for QoS>0 is required.
- *  \return     MQTT_CODE_SUCCESS, MQTT_CODE_CONTINUE (for non-blocking) or
-                MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS, MQTT_CODE_CONTINUE (for non-blocking),
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                MQTT_CODE_ERROR_PACKET_ID if the Packet Identifier is still
+                awaiting its acknowledgement [MQTT-2.3.1-2],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
     \sa         MqttClient_Publish
     \sa         MqttClient_Publish_ex
     \sa         MqttClient_WaitMessage_ex
@@ -564,7 +576,12 @@ WOLFMQTT_API int MqttClient_Publish_WriteOnly(
                 received but one or more filters were rejected (inspect each
                 subscribe->topics[i].return_code for the per-filter result;
                 v3.1.1 rejection is 0x80, v5 rejection is any reason_code
-                >= 0x80), or another MQTT_CODE_ERROR_* for transport/protocol
+                >= 0x80),
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                MQTT_CODE_ERROR_PACKET_ID if the Packet Identifier is still
+                awaiting its acknowledgement [MQTT-2.3.1-2],
+                or another MQTT_CODE_ERROR_* for transport/protocol
                 failures (see enum MqttPacketResponseCodes).
  */
 WOLFMQTT_API int MqttClient_Subscribe(
@@ -577,8 +594,12 @@ WOLFMQTT_API int MqttClient_Subscribe(
  *  \param      client      Pointer to MqttClient structure
  *  \param      unsubscribe Pointer to MqttUnsubscribe structure initialized
                             with topic list.
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS,
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                MQTT_CODE_ERROR_PACKET_ID if the Packet Identifier is still
+                awaiting its acknowledgement [MQTT-2.3.1-2],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Unsubscribe(
     MqttClient *client,
@@ -588,8 +609,10 @@ WOLFMQTT_API int MqttClient_Unsubscribe(
                 Ping Response packet
  *  \note This is a blocking function that will wait for MqttNet.read
  *  \param      client      Pointer to MqttClient structure
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS,
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Ping(
     MqttClient *client);
@@ -600,8 +623,10 @@ WOLFMQTT_API int MqttClient_Ping(
  *  \note This is a blocking function that will wait for MqttNet.read
  *  \param      client      Pointer to MqttClient structure
  *  \param      ping        Pointer to MqttPing structure
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS,
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Ping_ex(MqttClient *client, MqttPing* ping);
 
@@ -643,8 +668,10 @@ WOLFMQTT_API int MqttClient_PropsFree(
  *  \note This is a non-blocking function that will try and send using
                 MqttNet.write
  *  \param      client      Pointer to MqttClient structure
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS,
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Disconnect(
     MqttClient *client);
@@ -655,8 +682,10 @@ WOLFMQTT_API int MqttClient_Disconnect(
                 MqttNet.write
  *  \param      client      Pointer to MqttClient structure
  *  \param      disconnect  Pointer to MqttDisconnect structure. NULL is valid.
- *  \return     MQTT_CODE_SUCCESS or MQTT_CODE_ERROR_*
-                (see enum MqttPacketResponseCodes)
+ *  \return     MQTT_CODE_SUCCESS,
+                MQTT_CODE_ERROR_STAT if CONNECT has not been sent on this
+                Network Connection [MQTT-3.1.0-1],
+                or MQTT_CODE_ERROR_* (see enum MqttPacketResponseCodes)
  */
 WOLFMQTT_API int MqttClient_Disconnect_ex(
     MqttClient *client,

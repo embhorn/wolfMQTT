@@ -3078,6 +3078,88 @@ TEST(refused_connack_short_write_leaves_no_client)
     MqttBroker_Free(&broker);
 }
 
+/* If the resumed write of a refused CONNACK itself fails, the client is torn
+ * down without publishing a Will: a CONNECT refused before the Will was stored
+ * established no Session at all. */
+TEST(refused_connack_resume_write_failure_drops_client)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    byte connect[64];
+    size_t connect_len;
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    connect_len = build_v311_connect_emptyid(connect, 0x00);
+    reset_mock_state(connect, connect_len);
+
+    g_clients[0].write_limit_once = 1;
+    run_broker_one_connect(&broker);
+    ASSERT_NOT_NULL(broker.clients);
+    ASSERT_EQ(1, (int)broker.clients->connack_refused);
+
+    /* The rest of the refusal never makes it out. */
+    g_clients[0].write_err = 1;
+    (void)MqttBroker_Step(&broker);
+    ASSERT_NULL(broker.clients);
+    ASSERT_EQ(0, broker.orphan_session_count);
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
+/* A peer that never drains its socket must not hold a client slot forever
+ * while its accepted CONNACK is pending. Keep alive monitoring is held off
+ * for that window, so the handshake is bounded by BROKER_CONNECT_TIMEOUT_SEC
+ * measured from the CONNECT that produced the CONNACK. */
+TEST(accepted_connack_pending_times_out_and_closes)
+{
+    MqttBroker broker;
+    MqttBrokerNet net;
+    BrokerClient* bc;
+    /* v3.1.1 CONNECT: CleanSession=1, Keep Alive 0 (no keepalive at all, so
+     * only the handshake bound can close this client), ClientId "id". */
+    static const byte connect[] = {
+        0x10, 14,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04, 0x02,
+        0x00, 0x00,
+        0x00, 0x02, 'i', 'd'
+    };
+
+    install_mock_net(&net);
+    XMEMSET(&broker, 0, sizeof(broker));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Init(&broker, &net));
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttBroker_Start(&broker));
+
+    reset_mock_state(connect, sizeof(connect));
+    g_clients[0].write_limit_once = 1;
+    run_broker_one_connect(&broker);
+
+    bc = find_broker_client(&broker, "id");
+    ASSERT_NOT_NULL(bc);
+    ASSERT_EQ(4, bc->connack_pending_len);
+
+    /* Still pending but inside the bound: the client survives. */
+    g_clients[0].write_continue = 1;
+    g_broker_time_s = BROKER_CONNECT_TIMEOUT_SEC;
+    (void)MqttBroker_Step(&broker);
+    ASSERT_FALSE(g_client_closed);
+    ASSERT_NOT_NULL(find_broker_client(&broker, "id"));
+
+    /* Past the bound with the CONNACK still unwritten: the slot is reclaimed. */
+    g_broker_time_s = BROKER_CONNECT_TIMEOUT_SEC + 1;
+    (void)MqttBroker_Step(&broker);
+    ASSERT_TRUE(g_client_closed);
+    ASSERT_NULL(find_broker_client(&broker, "id"));
+
+    MqttBroker_Stop(&broker);
+    MqttBroker_Free(&broker);
+}
+
 /* MQTT 3.1.1 section 3.1.4 lists "Start message delivery and keep alive
  * monitoring" as the step after acknowledging the CONNECT. An accepted CONNACK
  * that is still only partly written must therefore not be cut short by its own
@@ -8251,6 +8333,8 @@ int main(int argc, char** argv)
     RUN_TEST(self_publish_waits_for_partial_puback);
     RUN_TEST(refused_connack_short_write_delivers_return_code_before_close);
     RUN_TEST(refused_connack_short_write_leaves_no_client);
+    RUN_TEST(refused_connack_resume_write_failure_drops_client);
+    RUN_TEST(accepted_connack_pending_times_out_and_closes);
     RUN_TEST(accepted_connack_pending_survives_keepalive_deadline);
     RUN_TEST(pending_write_does_not_bypass_keepalive);
     RUN_TEST(outbound_zero_progress_retry_keeps_dup_clear);

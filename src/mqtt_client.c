@@ -2461,7 +2461,11 @@ static int MqttConnect_HasRecvMax(const MqttConnect* mc_connect)
  * SUBSCRIBE, UNSUBSCRIBE, PINGREQ or DISCONNECT that would otherwise become
  * the first MQTT packet on the wire. A Client need not wait for CONNACK
  * (section 3.1.4), so this checks only that CONNECT has been sent. Callers
- * have already rejected a NULL client. */
+ * have already rejected a NULL client. Reads client->flags directly rather
+ * than through MqttClient_Flags so a lock failure is propagated instead of
+ * being reported as "no flags set", and so the NULL branch inside that helper
+ * does not leave GCC a path where client is NULL after the caller checked it
+ * (which produced a false -Warray-bounds under partial inlining). */
 static int MqttClient_CheckConnectSent(MqttClient *client)
 {
     word32 flags;
@@ -2501,6 +2505,13 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
 
     if (mc_connect->stat.write == MQTT_MSG_BEGIN) {
+        /* A new handshake starts a fresh outbound Packet Identifier space:
+         * the client keeps no unacknowledged outbound PUBLISH/PUBREL across a
+         * Network Connection, so nothing from the previous one is still in
+         * flight [MQTT-2.3.1-3]. Must stay outside the WOLFMQTT_V5 block
+         * below - the table exists in every build. */
+        MqttClient_SendIdsReset(client);
+
         /* [MQTT-3.1.0-2] A Client can only send the CONNECT Packet once over a
          * Network Connection; a Server must treat a second one as a protocol
          * violation and disconnect. A partially written CONNECT re-enters with
@@ -2530,12 +2541,6 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             return rc;
         }
         XMEMSET(&mc_connect->ack, 0, sizeof(mc_connect->ack));
-
-        /* A new handshake starts a fresh outbound Packet Identifier space:
-         * the client keeps no unacknowledged outbound PUBLISH/PUBREL across a
-         * Network Connection, so nothing from the previous one is still in
-         * flight [MQTT-2.3.1-3]. */
-        MqttClient_SendIdsReset(client);
 
         /* Record whether this connection negotiates enhanced authentication so
          * a later MqttClient_Auth can be refused when no Authentication Method
@@ -2666,20 +2671,33 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     }
     if (mc_connect->stat.write == MQTT_MSG_HEADER) {
         int xfer = client->write.len;
+        int wrote;
 
         /* Send connect packet */
         rc = MqttPacket_Write(client, client->tx_buf, xfer);
+
+        /* Bytes this call put on the transport. MqttSocket_Write leaves
+         * write.pos at the partial count and clears it only on a complete
+         * write, so read it before MqttWriteStop resets the state. */
+        wrote = (rc == xfer) ? xfer : client->write.pos;
+        if (wrote > 0) {
+            /* CONNECT bytes are on the wire, so this Network Connection has
+             * had its one CONNECT [MQTT-3.1.0-2] and the other send APIs are
+             * no longer blocked by [MQTT-3.1.0-1]. A Client need not wait for
+             * CONNACK before sending more packets (section 3.1.4). Keyed on
+             * bytes rather than the return code: a nonblocking write reports
+             * MQTT_CODE_CONTINUE even when it accepted nothing, and a
+             * blocking one reports an error after getting part of the packet
+             * out. Resuming this same write re-enters past MQTT_MSG_BEGIN, so
+             * the once-per-connection guard does not see it. */
+            (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
+        }
     #ifdef WOLFMQTT_NONBLOCK
         if (rc == MQTT_CODE_CONTINUE
         #ifdef WOLFMQTT_ALLOW_NODATA_UNLOCK
             && client->write.total > 0
         #endif
         ) {
-            /* Part of the CONNECT is already on the wire, so this Network
-             * Connection has had its one CONNECT [MQTT-3.1.0-2] and the other
-             * send APIs are no longer blocked by [MQTT-3.1.0-1]. Resuming this
-             * same write re-enters past MQTT_MSG_BEGIN and is unaffected. */
-            (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
             /* keep send locked and return early.
              * Note: tx_buf still contains credentials until write completes */
             return rc;
@@ -2693,17 +2711,12 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         MqttWriteStop(client, &mc_connect->stat);
 
         if (rc != xfer) {
-            /* Nothing usable reached the peer, so leave the handshake state
-             * clear and let the caller retry on this Network Connection. */
+            /* The handshake state set above stands or not on whether bytes
+             * reached the peer, so a retry is refused only when some of this
+             * CONNECT is already out there. */
             MqttClient_CancelMessage(client, (MqttObject*)mc_connect);
             return rc;
         }
-
-        /* CONNECT is on the wire: this Network Connection has had its one
-         * CONNECT [MQTT-3.1.0-2], and the other send APIs are no longer
-         * blocked by [MQTT-3.1.0-1]. A Client need not wait for CONNACK
-         * before sending more packets (section 3.1.4). */
-        (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_CONNECT_SENT);
 
     #ifdef WOLFMQTT_V5
         /* Enhanced authentication */
@@ -3346,6 +3359,7 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
         case MQTT_MSG_HEADER:
         {
             int xfer = client->write.len;
+            int wrote;
 
             /* Send publish packet */
             rc = MqttPacket_Write(client, client->tx_buf, xfer);
@@ -3359,6 +3373,10 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
                 return rc;
             }
         #endif
+            /* Bytes this call put on the transport, read before MqttWriteStop
+             * resets the write state. A blocking write can get part of the
+             * packet out and then fail. */
+            wrote = (rc == xfer) ? xfer : client->write.pos;
             client->write.len = 0; /* reset len, so publish chunk resets */
 
             /* if failure or no data was written yet */
@@ -3371,6 +3389,14 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
                 MqttClient_RestoreRecvQuota(client, publish);
             #endif
                 MqttClient_CancelMessage(client, (MqttObject*)publish);
+                if (wrote > 0) {
+                    /* Part of the PUBLISH reached the server, so it may have
+                     * seen the Packet Identifier. Reclaim the reservation the
+                     * cancel just dropped so a new message cannot take it
+                     * [MQTT-2.3.1-3]. */
+                    (void)MqttClient_SendIdReserve(client, publish->packet_id,
+                            publish, 1);
+                }
                 return rc;
             }
 
@@ -3399,6 +3425,11 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
                 MqttClient_RestoreRecvQuota(client, publish);
             #endif
                 MqttClient_CancelMessage(client, (MqttObject*)publish);
+                /* Reaching the payload means the fixed header - and with it
+                 * the Packet Identifier - is already on the wire, so keep the
+                 * reservation the cancel dropped [MQTT-2.3.1-3]. */
+                (void)MqttClient_SendIdReserve(client, publish->packet_id,
+                        publish, 1);
                 break;
             }
 
@@ -3620,6 +3651,7 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
     }
     if (subscribe->stat.write == MQTT_MSG_HEADER) {
         int xfer = client->write.len;
+        int wrote;
 
         /* Send subscribe packet */
         rc = MqttPacket_Write(client, client->tx_buf, xfer);
@@ -3633,11 +3665,19 @@ int MqttClient_Subscribe(MqttClient *client, MqttSubscribe *subscribe)
             return rc;
         }
     #endif
+        /* Bytes this call put on the transport, read before MqttWriteStop
+         * resets the write state. */
+        wrote = (rc == xfer) ? xfer : client->write.pos;
         MqttWriteStop(client, &subscribe->stat);
         if (rc != xfer) {
-            /* The cancel below gives the identifier back: nothing usable
-             * reached the wire [MQTT-2.3.1-3]. */
             MqttClient_CancelMessage(client, (MqttObject*)subscribe);
+            if (wrote > 0) {
+                /* Part of the SUBSCRIBE reached the server, so it may have
+                 * seen the Packet Identifier. Reclaim the reservation the
+                 * cancel just dropped [MQTT-2.3.1-3]. */
+                (void)MqttClient_SendIdReserve(client, subscribe->packet_id,
+                        subscribe, 1);
+            }
             return rc;
         }
 
@@ -3766,6 +3806,7 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
     }
     if (unsubscribe->stat.write == MQTT_MSG_HEADER) {
         int xfer = client->write.len;
+        int wrote;
 
         /* Send unsubscribe packet */
         rc = MqttPacket_Write(client, client->tx_buf, xfer);
@@ -3779,11 +3820,19 @@ int MqttClient_Unsubscribe(MqttClient *client, MqttUnsubscribe *unsubscribe)
             return rc;
         }
     #endif
+        /* Bytes this call put on the transport, read before MqttWriteStop
+         * resets the write state. */
+        wrote = (rc == xfer) ? xfer : client->write.pos;
         MqttWriteStop(client, &unsubscribe->stat);
         if (rc != xfer) {
-            /* The cancel below gives the identifier back: nothing usable
-             * reached the wire [MQTT-2.3.1-3]. */
             MqttClient_CancelMessage(client, (MqttObject*)unsubscribe);
+            if (wrote > 0) {
+                /* Part of the UNSUBSCRIBE reached the server, so it may have
+                 * seen the Packet Identifier. Reclaim the reservation the
+                 * cancel just dropped [MQTT-2.3.1-3]. */
+                (void)MqttClient_SendIdReserve(client, unsubscribe->packet_id,
+                        unsubscribe, 1);
+            }
             return rc;
         }
 
