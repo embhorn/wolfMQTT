@@ -574,7 +574,9 @@ static void MqttClient_RecvQos2_Remove(MqttClient* client, word16 packet_id)
  * no outbound session state across one.
  *
  * These are called from both the send and receive paths, so they take
- * client->lockClient themselves; no caller may already hold it. */
+ * client->lockClient themselves; no caller may already hold it. Every caller
+ * has already rejected a NULL client, as MqttWriteStop and the other internal
+ * helpers here assume. */
 static int MqttClient_SendIds_Find(const MqttClient* client, word16 packet_id)
 {
     int i;
@@ -598,7 +600,7 @@ static int MqttClient_SendIdReserve(MqttClient* client, word16 packet_id,
     int rc = MQTT_CODE_SUCCESS;
     int i;
 
-    if (client == NULL || packet_id == 0) {
+    if (packet_id == 0) {
         return MQTT_CODE_SUCCESS; /* nothing to track */
     }
 #ifdef WOLFMQTT_MULTITHREAD
@@ -645,7 +647,7 @@ static void MqttClient_SendIdRelease(MqttClient* client, word16 packet_id)
 {
     int i;
 
-    if (client == NULL || packet_id == 0) {
+    if (packet_id == 0) {
         return;
     }
 #ifdef WOLFMQTT_MULTITHREAD
@@ -670,7 +672,7 @@ static void MqttClient_SendIdReleaseOwner(MqttClient* client, const void* owner)
 {
     int i;
 
-    if (client == NULL || owner == NULL) {
+    if (owner == NULL) {
         return;
     }
 #ifdef WOLFMQTT_MULTITHREAD
@@ -695,9 +697,6 @@ static void MqttClient_SendIdReleaseOwner(MqttClient* client, const void* owner)
  * session state across one. */
 static void MqttClient_SendIdsReset(MqttClient* client)
 {
-    if (client == NULL) {
-        return;
-    }
 #ifdef WOLFMQTT_MULTITHREAD
     if (wm_SemLock(&client->lockClient) != MQTT_CODE_SUCCESS) {
         return;
@@ -2461,11 +2460,27 @@ static int MqttConnect_HasRecvMax(const MqttConnect* mc_connect)
  * the send APIs consult MQTT_CLIENT_FLAG_CONNECT_SENT to refuse a PUBLISH,
  * SUBSCRIBE, UNSUBSCRIBE, PINGREQ or DISCONNECT that would otherwise become
  * the first MQTT packet on the wire. A Client need not wait for CONNACK
- * (section 3.1.4), so this checks only that CONNECT has been sent. */
+ * (section 3.1.4), so this checks only that CONNECT has been sent. Callers
+ * have already rejected a NULL client. */
 static int MqttClient_CheckConnectSent(MqttClient *client)
 {
-    if ((MqttClient_Flags(client, 0, 0) &
-            MQTT_CLIENT_FLAG_CONNECT_SENT) == 0) {
+    word32 flags;
+#ifdef WOLFMQTT_MULTITHREAD
+    int rc;
+#endif
+
+#ifdef WOLFMQTT_MULTITHREAD
+    rc = wm_SemLock(&client->lockClient);
+    if (rc != 0) {
+        return rc;
+    }
+#endif
+    flags = client->flags;
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+
+    if ((flags & MQTT_CLIENT_FLAG_CONNECT_SENT) == 0) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
     }
     return MQTT_CODE_SUCCESS;
