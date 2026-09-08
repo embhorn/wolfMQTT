@@ -2189,6 +2189,328 @@ TEST(unsubscribe_too_many_reason_codes_is_malformed)
 #endif /* WOLFMQTT_V5 */
 
 /* ============================================================================
+ * Outbound Packet Identifier occupancy
+ *
+ * [MQTT-2.3.1-2] "Each time a Client sends a new packet of one of these types
+ * it MUST assign it a currently unused Packet Identifier", and [MQTT-2.3.1-3]
+ * makes it reusable only "after the Client has processed the corresponding
+ * acknowledgement packet". These run in every build: the pending-response list
+ * that used to be the only guard is WOLFMQTT_MULTITHREAD-only, and it drops
+ * its entry as soon as the call returns even when no acknowledgement arrived.
+ * ============================================================================ */
+
+/* Drive one QoS>0 publish whose acknowledgement never arrives: the mock read
+ * fails, so the PUBLISH is on the wire and unacknowledged when the call
+ * returns. Works in both blocking and nonblocking builds because the read
+ * error is reported immediately either way. */
+static int run_publish_unacked(MqttPublish* publish)
+{
+    int rc;
+    int i;
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read; /* network error */
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish(&test_client, publish);
+    }
+    return rc;
+}
+
+static void init_qos_publish(MqttPublish* publish, MqttQoS qos,
+    word16 packet_id, const char* topic, byte* payload, word32 len)
+{
+    XMEMSET(publish, 0, sizeof(*publish));
+    publish->qos = qos;
+    publish->packet_id = packet_id;
+    publish->topic_name = topic;
+    publish->buffer = payload;
+    publish->total_len = len;
+    publish->buffer_len = len;
+}
+
+TEST(publish_qos1_reuse_packet_id_before_puback_rejected)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* A second, different message reusing the still-unacknowledged Packet
+     * Identifier must be refused before anything reaches the wire. */
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/humidity",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = MqttClient_Publish(&test_client, &publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* Positive control: a currently unused identifier is still accepted while
+     * 0x1234 is in flight, so the guard is not refusing every publish. */
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1235, "sensor/humidity",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(2, g_frames_written);
+}
+
+/* [MQTT-3.3.1-1] A re-delivery attempt of the same PUBLISH carries DUP=1 and
+ * [MQTT-2.3.1-3] requires it to keep its original Packet Identifier, so the
+ * guard must let a retransmission through. */
+TEST(publish_qos1_retransmit_reuses_packet_id)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    publish.duplicate = 1;
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(2, g_frames_written);
+}
+
+/* [MQTT-2.3.1-3] For QoS 2 the identifier is released by PUBCOMP, so it is
+ * still in use after the PUBLISH has gone out unacknowledged. */
+TEST(publish_qos2_reuse_packet_id_before_pubcomp_rejected)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_2, 0x2233, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    init_qos_publish(&publish, MQTT_QOS_2, 0x2233, "sensor/humidity",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = MqttClient_Publish(&test_client, &publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(1, g_frames_written);
+}
+
+/* Processing the PUBACK releases the identifier [MQTT-2.3.1-3], so the same
+ * value is legal on the next message. Pins the release side of the guard. */
+TEST(publish_qos1_packet_id_reusable_after_puback)
+{
+    int rc;
+    int i;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+    /* v3.1.1 PUBACK: type 0x40, Remaining Length 2, Packet Identifier 0x1234. */
+    static const byte puback[] = { 0x40, 0x02, 0x12, 0x34 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, puback, sizeof(puback));
+    g_canned_len = (int)sizeof(puback);
+    g_canned_pos = 0;
+
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish(&test_client, &publish);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    g_canned_pos = 0; /* replay the same PUBACK for the second publish */
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/humidity",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish(&test_client, &publish);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(2, g_frames_written);
+}
+
+/* [MQTT-2.3.1-2] applies to SUBSCRIBE as well; SUBACK releases the
+ * identifier. SUBSCRIBE has no DUP bit, so a repeat cannot be told apart from
+ * a new subscription and is refused. */
+TEST(subscribe_reuse_packet_id_before_suback_rejected)
+{
+    int rc;
+    int i;
+    MqttSubscribe subscribe;
+    MqttTopic topic;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read; /* no SUBACK ever arrives */
+
+    XMEMSET(&subscribe, 0, sizeof(subscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "sensor/temp";
+    topic.qos = MQTT_QOS_0;
+    subscribe.packet_id = 0x1234;
+    subscribe.topic_count = 1;
+    subscribe.topics = &topic;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Subscribe(&test_client, &subscribe);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* A second, different SUBSCRIBE on the same identifier is refused. */
+    XMEMSET(&subscribe, 0, sizeof(subscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "sensor/humidity";
+    topic.qos = MQTT_QOS_0;
+    subscribe.packet_id = 0x1234;
+    subscribe.topic_count = 1;
+    subscribe.topics = &topic;
+
+    rc = MqttClient_Subscribe(&test_client, &subscribe);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    /* Positive control: another identifier still goes out. */
+    subscribe.packet_id = 0x1235;
+    subscribe.stat.write = MQTT_MSG_BEGIN;
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Subscribe(&test_client, &subscribe);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(2, g_frames_written);
+}
+
+/* Same rule for UNSUBSCRIBE, released by UNSUBACK. */
+TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected)
+{
+    int rc;
+    int i;
+    MqttUnsubscribe unsubscribe;
+    MqttTopic topic;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read; /* no UNSUBACK ever arrives */
+
+    XMEMSET(&unsubscribe, 0, sizeof(unsubscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "sensor/temp";
+    unsubscribe.packet_id = 0x1234;
+    unsubscribe.topic_count = 1;
+    unsubscribe.topics = &topic;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Unsubscribe(&test_client, &unsubscribe);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(1, g_frames_written);
+
+    XMEMSET(&unsubscribe, 0, sizeof(unsubscribe));
+    XMEMSET(&topic, 0, sizeof(topic));
+    topic.topic_filter = "sensor/humidity";
+    unsubscribe.packet_id = 0x1234;
+    unsubscribe.topic_count = 1;
+    unsubscribe.topics = &topic;
+
+    rc = MqttClient_Unsubscribe(&test_client, &unsubscribe);
+    ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
+    ASSERT_EQ(1, g_frames_written);
+}
+
+/* The identifiers were in use on one Network Connection only; closing it
+ * clears them, since the client keeps no outbound session state across one. */
+TEST(net_disconnect_frees_in_flight_packet_ids)
+{
+    int rc;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+
+    g_frames_written = 0;
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+
+    test_net.disconnect = mock_net_disconnect;
+    rc = MqttClient_NetDisconnect(&test_client);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    test_client_connect_sent();
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+    ASSERT_EQ(2, g_frames_written);
+}
+
+/* ============================================================================
  * MqttClient_Disconnect Tests
  * ============================================================================ */
 
@@ -5318,6 +5640,13 @@ void run_mqtt_client_tests(void)
 #endif
 
     /* MqttClient_Disconnect tests */
+    RUN_TEST(publish_qos1_reuse_packet_id_before_puback_rejected);
+    RUN_TEST(publish_qos1_retransmit_reuses_packet_id);
+    RUN_TEST(publish_qos2_reuse_packet_id_before_pubcomp_rejected);
+    RUN_TEST(publish_qos1_packet_id_reusable_after_puback);
+    RUN_TEST(subscribe_reuse_packet_id_before_suback_rejected);
+    RUN_TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected);
+    RUN_TEST(net_disconnect_frees_in_flight_packet_ids);
     RUN_TEST(disconnect_null_client);
 
     /* MqttClient_GetProtocolVersion tests */

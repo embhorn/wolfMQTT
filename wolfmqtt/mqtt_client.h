@@ -243,6 +243,27 @@ typedef struct _MqttSk {
     #endif
 #endif
 
+/* Max distinct outbound Packet Identifiers tracked as in flight. Each new
+ * SUBSCRIBE, UNSUBSCRIBE or QoS>0 PUBLISH must use a currently unused
+ * identifier [MQTT-2.3.1-2], and it only becomes reusable once the matching
+ * SUBACK / UNSUBACK / PUBACK / PUBCOMP has been processed [MQTT-2.3.1-3].
+ * Override in user_settings.h to trade memory for a larger in-flight window. */
+#ifndef MQTT_MAX_SEND_INFLIGHT
+    #define MQTT_MAX_SEND_INFLIGHT 16
+#endif
+#if (MQTT_MAX_SEND_INFLIGHT < 1) || (MQTT_MAX_SEND_INFLIGHT > 65535)
+    #error "MQTT_MAX_SEND_INFLIGHT must be between 1 and 65535"
+#endif
+
+/* One outbound Packet Identifier reservation. packet_id 0 marks a free slot;
+ * a Packet Identifier is never 0 [MQTT-2.3.1-1]. owner is the message object
+ * that made the reservation, so MqttClient_CancelMessage can give it back
+ * without knowing which packet type the object holds. */
+typedef struct _MqttSendId {
+    void*  owner;
+    word16 packet_id;
+} MqttSendId;
+
 /* Client structure */
 typedef struct _MqttClient {
     word32       flags; /* MqttClientFlags */
@@ -344,6 +365,12 @@ typedef struct _MqttClient {
      * is empty; a QoS 2 packet id is never 0. */
     word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
 #endif
+
+    /* Outbound Packet Identifiers written on the current Network Connection
+     * and not yet released by their acknowledgement. Cleared when a connection
+     * starts or ends, since the client keeps no outbound session state across
+     * one. */
+    MqttSendId send_inflight[MQTT_MAX_SEND_INFLIGHT];
 } MqttClient;
 
 #ifdef WOLFMQTT_SN
