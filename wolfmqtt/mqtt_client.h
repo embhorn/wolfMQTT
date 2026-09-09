@@ -320,6 +320,14 @@ typedef struct _MqttReplayMsg {
 } MqttReplayMsg;
 #endif /* !WOLFMQTT_NO_SESSION_REPLAY */
 
+/* [MQTT-3.1.3-2] The ClientId identifies the Client and its Session. Both the
+ * inbound QoS 2 de-duplication table and the outbound Session replay store use
+ * a fingerprint of it to tell a resumed Session from a different one, so the
+ * fingerprint exists whenever either of them does. */
+#if (WOLFMQTT_MAX_QOS >= 2) || !defined(WOLFMQTT_NO_SESSION_REPLAY)
+    #define WOLFMQTT_SESSION_ID_HASH
+#endif
+
 /* One outbound Packet Identifier reservation. packet_id 0 marks a free slot;
  * a Packet Identifier is never 0 [MQTT-2.3.1-1]. owner is the message object
  * that made the reservation, so MqttClient_CancelMessage can give it back
@@ -434,10 +442,12 @@ typedef struct _MqttClient {
      * with PUBREC but not delivered a second time [MQTT-4.3.3-10]. Slot value 0
      * is empty; a QoS 2 packet id is never 0. */
     word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
-    /* Fingerprint of the ClientId that populated recv_qos2_pending.
-     * [MQTT-3.1.3-2] makes the ClientId identify the Session state, so a
-     * Session Present answer for a different ClientId must not inherit the
-     * previous one's pending ids. 0 means no Session has been recorded. */
+#endif
+#ifdef WOLFMQTT_SESSION_ID_HASH
+    /* Fingerprint of the ClientId whose Session state this client holds - the
+     * inbound QoS 2 pending ids and the outbound replay pool. A Session
+     * Present answer for a different ClientId is a different Session and must
+     * not inherit either [MQTT-3.1.3-2]. 0 means no Session recorded. */
     word32 session_client_id_hash;
 #endif
 

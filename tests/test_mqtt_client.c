@@ -1350,6 +1350,7 @@ TEST(publish_qos1_v5_receive_max_quota_exhausted_rejects_before_send)
 
 #ifdef WOLFMQTT_NONBLOCK
 /* Quota decrements once per publish, not per non-blocking re-entry. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_v5_receive_max_quota_decrements_once_and_replenishes)
 {
     int rc;
@@ -1397,6 +1398,7 @@ TEST(publish_qos1_v5_receive_max_quota_decrements_once_and_replenishes)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(5, test_client.server_recv_max);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 #endif /* WOLFMQTT_NONBLOCK */
 
 /* These two exercise MqttClient_CancelMessage, which is only a public API when
@@ -2221,6 +2223,7 @@ TEST(unsubscribe_too_many_reason_codes_is_malformed)
  * fails, so the PUBLISH is on the wire and unacknowledged when the call
  * returns. Works in both blocking and nonblocking builds because the read
  * error is reported immediately either way. */
+#if WOLFMQTT_MAX_QOS >= 1
 static int run_publish_unacked(MqttPublish* publish)
 {
     int rc;
@@ -2236,6 +2239,8 @@ static int run_publish_unacked(MqttPublish* publish)
     return rc;
 }
 
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
+
 static void init_qos_publish(MqttPublish* publish, MqttQoS qos,
     word16 packet_id, const char* topic, byte* payload, word32 len)
 {
@@ -2248,6 +2253,7 @@ static void init_qos_publish(MqttPublish* publish, MqttQoS qos,
     publish->buffer_len = len;
 }
 
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_reuse_packet_id_before_puback_rejected)
 {
     int rc;
@@ -2284,10 +2290,12 @@ TEST(publish_qos1_reuse_packet_id_before_puback_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(2, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* [MQTT-3.3.1-1] A re-delivery attempt of the same PUBLISH carries DUP=1 and
  * [MQTT-2.3.1-3] requires it to keep its original Packet Identifier, so the
  * guard must let a retransmission through. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_retransmit_reuses_packet_id)
 {
     int rc;
@@ -2315,7 +2323,9 @@ TEST(publish_qos1_retransmit_reuses_packet_id)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(2, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
+#if WOLFMQTT_MAX_QOS >= 2
 /* [MQTT-2.3.1-3] For QoS 2 the identifier is released by PUBCOMP, so it is
  * still in use after the PUBLISH has gone out unacknowledged. */
 TEST(publish_qos2_reuse_packet_id_before_pubcomp_rejected)
@@ -2344,9 +2354,11 @@ TEST(publish_qos2_reuse_packet_id_before_pubcomp_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_PACKET_ID, rc);
     ASSERT_EQ(1, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 2 */
 
 /* Processing the PUBACK releases the identifier [MQTT-2.3.1-3], so the same
  * value is legal on the next message. Pins the release side of the guard. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_packet_id_reusable_after_puback)
 {
     int rc;
@@ -2389,6 +2401,7 @@ TEST(publish_qos1_packet_id_reusable_after_puback)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(2, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* [MQTT-2.3.1-2] applies to SUBSCRIBE as well; SUBACK releases the
  * identifier. SUBSCRIBE has no DUP bit, so a repeat cannot be told apart from
@@ -2502,6 +2515,7 @@ TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected)
  * MQTT_CLIENT_FLAG_IS_CONNECTED on a fatal error, the application calls
  * MqttClient_NetConnect (which clears MQTT_CLIENT_FLAG_CONNECT_SENT) and then
  * MqttClient_Connect. Guards the reset against being compiled out. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(connect_frees_in_flight_packet_ids)
 {
     int rc;
@@ -2554,12 +2568,14 @@ TEST(connect_frees_in_flight_packet_ids)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(1, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* Past MQTT_MAX_SEND_INFLIGHT the table cannot record any more identifiers, so
  * the collision check is best effort by design: the send is allowed rather
  * than refused, since an application may legitimately keep more than that many
  * packets in flight. Pins that contract so a later change to fail closed is a
  * deliberate one. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(send_inflight_table_full_still_allows_new_packet_id)
 {
     int rc;
@@ -2594,9 +2610,11 @@ TEST(send_inflight_table_full_still_allows_new_packet_id)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(1, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* The identifiers were in use on one Network Connection only; closing it
  * clears them, since the client keeps no outbound session state across one. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(net_disconnect_frees_in_flight_packet_ids)
 {
     int rc;
@@ -2627,6 +2645,7 @@ TEST(net_disconnect_frees_in_flight_packet_ids)
     ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
     ASSERT_EQ(2, g_frames_written);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* [MQTT-4.6.0-2] "It MUST send PUBACK packets in the order in which the
  * corresponding PUBLISH packets were received". The acknowledgement used to be
@@ -2826,7 +2845,7 @@ TEST(net_connect_clears_connect_sent_flag)
  * Session state, and section 4.4 requires them re-sent with their original
  * Packet Identifiers when the Client reconnects with CleanSession 0.
  * ============================================================================ */
-#ifndef WOLFMQTT_NO_SESSION_REPLAY
+#if !defined(WOLFMQTT_NO_SESSION_REPLAY) && WOLFMQTT_MAX_QOS >= 1
 /* Reconnect against a CONNACK carrying the given Session Present bit and
  * return the result, so a test can observe what the replay put on the wire. */
 static int run_reconnect_with(MqttConnect* connect, int session_present,
@@ -3656,7 +3675,7 @@ TEST(replay_resume_arms_keep_alive)
     ASSERT_EQ(60, (int)test_client.keep_alive_sec);
 }
 #endif /* WOLFMQTT_NONBLOCK */
-#endif /* !WOLFMQTT_NO_SESSION_REPLAY */
+#endif /* !WOLFMQTT_NO_SESSION_REPLAY && WOLFMQTT_MAX_QOS >= 1 */
 
 
 /* ============================================================================
@@ -4259,7 +4278,7 @@ TEST(publish_stream_cb_nonblock_resume_no_tail_drop)
 }
 #endif /* WOLFMQTT_NONBLOCK */
 
-#ifdef WOLFMQTT_V5
+#if defined(WOLFMQTT_V5) && WOLFMQTT_MAX_QOS >= 1
 /* Drives one QoS>0 publish to completion against the canned-response mock and
  * returns the final MqttClient_Publish result. The caller stages the broker's
  * PUBACK/PUBCOMP (plus any intermediate PUBREC for QoS 2) in g_canned_buf. */
@@ -4296,6 +4315,7 @@ static int run_publish_with_canned_resp(MqttPublish* publish,
  * MQTT_CODE_ERROR_PUBLISH_REJECTED rather than MQTT_CODE_SUCCESS, else the
  * application proceeds as if the message was delivered. This pins the
  * detection that the publish path previously lacked (known issue 3626). */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_v5_broker_rejection_returns_publish_rejected)
 {
     int rc;
@@ -4318,10 +4338,12 @@ TEST(publish_qos1_v5_broker_rejection_returns_publish_rejected)
     ASSERT_EQ(MQTT_CODE_ERROR_PUBLISH_REJECTED, rc);
     ASSERT_EQ(MQTT_REASON_NOT_AUTHORIZED, publish.resp.reason_code);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* A v5 PUBACK with reason code Success (0x00) means the broker accepted the
  * message; MqttClient_Publish must still return success and not false-trip the
  * new rejection check. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_v5_success_returns_success)
 {
     int rc;
@@ -4344,6 +4366,7 @@ TEST(publish_qos1_v5_success_returns_success)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(MQTT_REASON_SUCCESS, publish.resp.reason_code);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* Not every non-zero v5 reason code is a rejection: the high bit distinguishes
  * error (>= 0x80) from success-class codes. A broker legitimately returns
@@ -4351,6 +4374,7 @@ TEST(publish_qos1_v5_success_returns_success)
  * subscriptions, and the message WAS accepted. The check uses
  * (reason_code & 0x80) precisely so 0x10 stays a success; this pins that
  * boundary against a regression to e.g. (reason_code != 0). */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_qos1_v5_no_matching_subscribers_returns_success)
 {
     int rc;
@@ -4373,6 +4397,7 @@ TEST(publish_qos1_v5_no_matching_subscribers_returns_success)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
     ASSERT_EQ(MQTT_REASON_NO_MATCH_SUB, publish.resp.reason_code);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 #if WOLFMQTT_MAX_QOS >= 2
 /* A QoS-capped build refuses a QoS 2 publish before it reaches the wire, so
@@ -4974,6 +4999,7 @@ TEST(connect_v5_app_receive_max_preserved)
  * for protocol level < 5. Pre-seed resp.reason_code with a failure byte to
  * prove the protocol_level guard prevents a stale value from being misread as
  * a broker rejection. */
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_v311_ack_not_misread_as_rejected)
 {
     int rc;
@@ -4997,6 +5023,7 @@ TEST(publish_v311_ack_not_misread_as_rejected)
 
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
     WOLFMQTT_MAX_QOS >= 2
@@ -5472,6 +5499,7 @@ TEST(disconnect_clears_recv_quota_ownership)
  * response list is in use) and NONBLOCK (so the write-only publish leaves
  * the pendResp in the list across the call boundary). */
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK)
+#if WOLFMQTT_MAX_QOS >= 1
 TEST(publish_writeonly_rejects_duplicate_in_flight_packet_id)
 {
     int rc;
@@ -5543,6 +5571,7 @@ TEST(publish_writeonly_rejects_duplicate_in_flight_packet_id)
     (void)MqttClient_CancelMessage(&test_client, (MqttObject*)&publish1);
     (void)MqttClient_CancelMessage(&test_client, (MqttObject*)&publish2);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 
 /* Cross-packet-type collision: an in-flight SUBSCRIBE_ACK and a new QoS 1
  * publish must not share a Packet Identifier. The MQTT spec treats the
@@ -5551,6 +5580,7 @@ TEST(publish_writeonly_rejects_duplicate_in_flight_packet_id)
  * collision regardless of whether the existing entry is a PUBLISH_ACK,
  * SUBSCRIBE_ACK, UNSUBSCRIBE_ACK, etc. This test guards against a future
  * narrowing of the check to a single packet_type family. */
+#if WOLFMQTT_MAX_QOS >= 1
 static int mock_net_read_continue(void *context, byte* buf, int buf_len,
     int timeout_ms)
 {
@@ -5607,6 +5637,7 @@ TEST(subscribe_in_flight_blocks_publish_with_same_packet_id)
     (void)MqttClient_CancelMessage(&test_client, (MqttObject*)&subscribe);
     (void)MqttClient_CancelMessage(&test_client, (MqttObject*)&publish);
 }
+#endif /* WOLFMQTT_MAX_QOS >= 1 */
 #endif /* WOLFMQTT_MULTITHREAD && WOLFMQTT_NONBLOCK */
 
 
@@ -6956,15 +6987,29 @@ void run_mqtt_client_tests(void)
 #endif
 
     /* MqttClient_Disconnect tests */
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_reuse_packet_id_before_puback_rejected);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_retransmit_reuses_packet_id);
+#endif
+#if WOLFMQTT_MAX_QOS >= 2
     RUN_TEST(publish_qos2_reuse_packet_id_before_pubcomp_rejected);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_packet_id_reusable_after_puback);
+#endif
     RUN_TEST(subscribe_reuse_packet_id_before_suback_rejected);
     RUN_TEST(unsubscribe_reuse_packet_id_before_unsuback_rejected);
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(connect_frees_in_flight_packet_ids);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(send_inflight_table_full_still_allows_new_packet_id);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(net_disconnect_frees_in_flight_packet_ids);
+#endif
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK) && \
     WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(wait_message_puback_survives_shared_ack_overwrite);
@@ -6972,7 +7017,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(net_connect_clears_connect_sent_flag);
     RUN_TEST(publish_after_disconnect_rejected);
     RUN_TEST(reconnect_on_reused_connect_object_waits_for_connack);
-#ifndef WOLFMQTT_NO_SESSION_REPLAY
+#if !defined(WOLFMQTT_NO_SESSION_REPLAY) && WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(reconnect_replays_unacked_qos1_publish);
     RUN_TEST(reconnect_without_session_present_replays_nothing);
     RUN_TEST(reconnect_does_not_replay_acked_publish);
@@ -7032,9 +7077,15 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_stream_cb_nonblock_resume_no_tail_drop);
 #endif
 #ifdef WOLFMQTT_V5
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_v5_broker_rejection_returns_publish_rejected);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_v5_success_returns_success);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_v5_no_matching_subscribers_returns_success);
+#endif
 #if WOLFMQTT_MAX_QOS >= 2
     RUN_TEST(publish_qos2_v5_broker_rejection_returns_publish_rejected);
     RUN_TEST(publish_qos2_v5_success_returns_success);
@@ -7051,14 +7102,18 @@ void run_mqtt_client_tests(void)
     RUN_TEST(connect_v5_advertises_receive_max);
     RUN_TEST(connect_v5_app_receive_max_preserved);
 #endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_v311_ack_not_misread_as_rejected);
+#endif
     RUN_TEST(publish_v5_topic_alias_zero_rejected);
     RUN_TEST(publish_v5_topic_alias_exceeds_max_rejected);
     RUN_TEST(publish_v5_subscription_id_rejected);
     RUN_TEST(publish_v5_oversized_packet_rejected_before_write);
     RUN_TEST(publish_v5_within_max_packet_size_allowed);
 #ifdef WOLFMQTT_NONBLOCK
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_qos1_v5_receive_max_quota_decrements_once_and_replenishes);
+#endif
 #endif
     RUN_TEST(publish_qos1_v5_receive_max_quota_exhausted_rejects_before_send);
 #if defined(WOLFMQTT_MULTITHREAD) || defined(WOLFMQTT_NONBLOCK)
@@ -7072,7 +7127,8 @@ void run_mqtt_client_tests(void)
     RUN_TEST(publish_qos2_v5_pubrec_rejection_multithread_reader);
     RUN_TEST(publish_qos2_v5_pubrec_state_multithread_reader);
 #endif
-#ifdef WOLFMQTT_MULTITHREAD
+/* Every write-only publish test drives a QoS > 0 message. */
+#if defined(WOLFMQTT_MULTITHREAD) && WOLFMQTT_MAX_QOS >= 1
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(publish_writeonly_v5_receive_max_quota_exhausted_rejects);
     RUN_TEST(publish_writeonly_v5_receive_max_released_on_puback);
@@ -7087,8 +7143,12 @@ void run_mqtt_client_tests(void)
 #endif
 #endif
 #if defined(WOLFMQTT_MULTITHREAD) && defined(WOLFMQTT_NONBLOCK)
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(publish_writeonly_rejects_duplicate_in_flight_packet_id);
+#endif
+#if WOLFMQTT_MAX_QOS >= 1
     RUN_TEST(subscribe_in_flight_blocks_publish_with_same_packet_id);
+#endif
 #endif
 
     /* MqttClient_WaitMessage tests */

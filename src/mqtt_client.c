@@ -500,9 +500,9 @@ static void MqttClient_RecvQuotaRelease(MqttClient* client, MqttMsgStat* stat)
 }
 #endif /* WOLFMQTT_V5 */
 
-#if WOLFMQTT_MAX_QOS >= 2
-/* Fingerprint the ClientId so the inbound QoS 2 table can tell whether a
- * resumed Session belongs to the same one. A collision leaves stale entries in
+#ifdef WOLFMQTT_SESSION_ID_HASH
+/* Fingerprint the ClientId so the Session state can tell whether a resumed
+ * Session belongs to the same one. A collision leaves stale entries in
  * place, which is exactly the behaviour before this check existed, so the
  * cheap hash only ever improves on it. Never returns 0; that value marks
  * "no Session recorded". */
@@ -520,7 +520,9 @@ static word32 MqttClient_ClientIdHash(const char* client_id)
     }
     return (hash == 0) ? 1 : hash;
 }
+#endif /* WOLFMQTT_SESSION_ID_HASH */
 
+#if WOLFMQTT_MAX_QOS >= 2
 /* Inbound QoS 2 de-duplication. A subscribing client that has delivered a
  * QoS 2 PUBLISH to the application and answered with PUBREC records its packet
  * id until the matching PUBREL arrives, so a retransmitted PUBLISH is
@@ -2992,7 +2994,9 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 {
     int rc;
     word32 connect_flags = 0;
+#ifdef WOLFMQTT_SESSION_ID_HASH
     int session_id_matched = 0;
+#endif
 #if defined(WOLFMQTT_V5) && WOLFMQTT_MAX_QOS >= 2
     MqttProp recv_max_prop;
     MqttProp* app_props = NULL;
@@ -3414,6 +3418,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_SERVER_PROP);
     }
 
+#ifdef WOLFMQTT_SESSION_ID_HASH
     /* [MQTT-3.1.3-2] The ClientId identifies the Client and its Session, so
      * session state carries over only when the ClientId is the same one that
      * created it. Recorded here, before the per-table decisions below, because
@@ -3424,6 +3429,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         session_id_matched = (id_hash == client->session_client_id_hash);
         client->session_client_id_hash = id_hash;
     }
+#endif
 
 #if WOLFMQTT_MAX_QOS >= 2
     /* The server's Session Present flag, not the client's request, decides
