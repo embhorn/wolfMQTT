@@ -2759,6 +2759,37 @@ TEST(reconnect_on_reused_connect_object_waits_for_connack)
     }
 }
 
+/* [MQTT-3.14.4-1] "After sending a DISCONNECT Packet the Client MUST NOT send
+ * any more Control Packets on that Network Connection." The send APIs enforce
+ * that the same way they refuse packets before CONNECT. */
+TEST(publish_after_disconnect_rejected)
+{
+    int rc;
+    MqttDisconnect disconnect;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client_connect_sent();
+
+    test_net.write = mock_net_write_accept;
+    XMEMSET(&disconnect, 0, sizeof(disconnect));
+    rc = MQTT_CODE_CONTINUE;
+    while (rc == MQTT_CODE_CONTINUE) {
+        rc = MqttClient_Disconnect_ex(&test_client, &disconnect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* The transport is still up, but the MQTT session is over. */
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    g_frames_written = 0;
+    rc = MqttClient_Publish(&test_client, &publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_STAT, rc);
+    ASSERT_EQ(0, g_frames_written);
+}
+
 /* [MQTT-3.1.0-1] A new Network Connection starts with no MQTT packet sent, so
  * MqttClient_NetConnect must clear MQTT_CLIENT_FLAG_CONNECT_SENT as it sets
  * MQTT_CLIENT_FLAG_IS_CONNECTED. Otherwise a client reconnecting after a
@@ -2845,6 +2876,16 @@ static int run_reconnect(MqttConnect* connect, int session_present)
     return run_reconnect_with(connect, session_present, mock_net_write_accept);
 }
 
+/* Complete a first handshake with the ClientId the reconnect will use. The
+ * client binds outbound Session state to the ClientId that created it
+ * [MQTT-3.1.3-2], so a test that publishes before ever connecting has no
+ * Session to resume and nothing would be replayed. Session Present = 0: this
+ * is a new Session. */
+static int run_initial_connect(MqttConnect* connect)
+{
+    return run_reconnect_with(connect, 0, mock_net_write_accept);
+}
+
 /* An unacknowledged QoS 1 PUBLISH is re-sent after a resumed Session, with the
  * original Packet Identifier and DUP set [MQTT-4.4.0-1], [MQTT-3.3.1-1]. */
 TEST(reconnect_replays_unacked_qos1_publish)
@@ -2856,10 +2897,13 @@ TEST(reconnect_replays_unacked_qos1_publish)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     /* Publish, no PUBACK: it stays unacknowledged Session state. */
     init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
@@ -2895,10 +2939,13 @@ TEST(reconnect_without_session_present_replays_nothing)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
         payload, (word32)(sizeof(payload) - 1));
@@ -2927,10 +2974,13 @@ TEST(reconnect_does_not_replay_acked_publish)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     test_net.write = mock_net_write_accept;
     test_net.read = mock_net_read_canned;
@@ -2970,10 +3020,13 @@ TEST(reconnect_replays_unacked_pubrel)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     test_net.write = mock_net_write_accept;
     test_net.read = mock_net_read_canned;
@@ -3097,10 +3150,13 @@ TEST(reconnect_drops_replay_larger_than_tx_buf)
 
     rc = test_init_client(); /* tx_buf_len = TEST_TX_BUF_SIZE (256) */
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     XMEMSET(g_replay_big_payload, 0x5A, sizeof(g_replay_big_payload));
     init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
@@ -3137,10 +3193,13 @@ TEST(reconnect_replays_at_most_pool_size)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     for (i = 0; i < MQTT_MAX_REPLAY_MSGS + 1; i++) {
         init_qos_publish(&publish, MQTT_QOS_1, (word16)(0x100 + i),
@@ -3179,10 +3238,13 @@ TEST(reconnect_does_not_replay_streamed_publish)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     XMEMSET(g_replay_stream_buf, 0, sizeof(g_replay_stream_buf));
     test_net.write = mock_net_write_accept;
@@ -3230,10 +3292,13 @@ TEST(reconnect_dropped_replay_frees_packet_id)
 
     rc = test_init_client(); /* tx_buf_len = TEST_TX_BUF_SIZE (256) */
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     /* Retained, but too large to rebuild in one tx_buf pass: the replay drops
      * it rather than putting a truncated packet on the wire. */
@@ -3266,6 +3331,230 @@ TEST(reconnect_dropped_replay_frees_packet_id)
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
 }
 
+/* [MQTT-3.1.3-2] The ClientId identifies the Client and its Session, so
+ * outbound Session state belongs to the ClientId that created it. A Session
+ * Present answer for a different ClientId is a different Session: replaying
+ * into it would inject one Session's messages into another. */
+TEST(reconnect_with_new_client_id_does_not_replay)
+{
+    int rc;
+    int i;
+    byte connack[4];
+    MqttConnect connect;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
+
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    /* Same client object, different ClientId, server says Session Present. */
+    replay_mock_reset();
+    rc = run_reconnect_with(&connect, 1, replay_mock_write);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(2, g_replay_frames); /* CONNECT + the replay for this ClientId */
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    replay_mock_reset();
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.keep_alive_sec = 60;
+    connect.clean_session = 0;
+    connect.client_id = "a_different_client";
+
+    connack[0] = 0x20;
+    connack[1] = 0x02;
+    connack[2] = 0x01; /* Session Present */
+    connack[3] = 0x00;
+    test_net.write = replay_mock_write;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, connack, sizeof(connack));
+    g_canned_len = (int)sizeof(connack);
+    g_canned_pos = 0;
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Connect(&test_client, &connect);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    /* The CONNECT only: the previous ClientId's message is not this Session's
+     * state and must not be injected into it. */
+    ASSERT_EQ(1, g_replay_frames);
+    ASSERT_EQ(MQTT_PACKET_TYPE_CONNECT, g_replay_types[0]);
+}
+
+/* Section 3.3.3 allows a zero-byte PUBLISH payload, and [MQTT-4.4.0-1] asks
+ * for an unacknowledged one back like any other. It must be retained rather
+ * than treated as a payload the client could not copy. */
+TEST(reconnect_replays_unacked_zero_length_payload)
+{
+    int rc;
+    MqttConnect connect;
+    MqttPublish publish;
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
+
+    init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp", NULL, 0);
+    rc = run_publish_unacked(&publish);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    replay_mock_reset();
+    rc = run_reconnect_with(&connect, 1, replay_mock_write);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+
+    /* CONNECT plus the replayed empty PUBLISH, complete on the wire. */
+    ASSERT_EQ(2, g_replay_frames);
+    ASSERT_EQ(MQTT_PACKET_TYPE_PUBLISH, g_replay_types[1]);
+    ASSERT_EQ(g_replay_declared[1], g_replay_written[1]);
+}
+
+/* An entry the replay can never re-send must not keep its Packet Identifier
+ * reserved for the life of the connection: nothing will ever acknowledge it
+ * [MQTT-2.3.1-3]. */
+TEST(reconnect_unreplayable_entry_frees_packet_id)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    MqttPublish publish;
+    static const byte puback[] = { 0x40, 0x02, 0x43, 0x21 };
+    static byte small[] = "hi";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
+
+    /* Streamed publish: the payload goes out through the callback, so the
+     * client keeps no copy and the message cannot be replayed. */
+    XMEMSET(g_replay_stream_buf, 0, sizeof(g_replay_stream_buf));
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read; /* network error: no PUBACK */
+
+    XMEMSET(&publish, 0, sizeof(publish));
+    publish.qos = MQTT_QOS_1;
+    publish.packet_id = 0x4321;
+    publish.topic_name = "sensor/temp";
+    publish.buffer = g_replay_stream_buf;
+    publish.buffer_len = (word32)REPLAY_STREAM_CHUNK;
+    publish.total_len = (word32)REPLAY_BIG_PAYLOAD_LEN;
+
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish_ex(&test_client, &publish, replay_stream_cb);
+    }
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+
+    ASSERT_EQ(MQTT_CODE_SUCCESS, MqttClient_NetDisconnect(&test_client));
+
+    replay_mock_reset();
+    rc = run_reconnect_with(&connect, 1, replay_mock_write);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, g_replay_frames); /* the CONNECT only */
+
+    /* The identifier is free again, so a new PUBLISH may take it. */
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, puback, sizeof(puback));
+    g_canned_len = (int)sizeof(puback);
+    g_canned_pos = 0;
+
+    init_qos_publish(&publish, MQTT_QOS_1, 0x4321, "sensor/temp",
+        small, (word32)(sizeof(small) - 1));
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish(&test_client, &publish);
+    }
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+}
+
+#if WOLFMQTT_MAX_QOS >= 2
+/* Count how many in-flight slots hold packet_id. */
+static int send_id_reserved(word16 packet_id)
+{
+    int i;
+    int n = 0;
+
+    for (i = 0; i < MQTT_MAX_SEND_INFLIGHT; i++) {
+        if (test_client.send_inflight[i].packet_id == packet_id) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* [MQTT-2.3.1-3] A Packet Identifier is reusable only once the exchange it
+ * belongs to completes. A QoS 2 exchange completes on PUBCOMP, so a PUBACK
+ * naming that identifier is the wrong acknowledgement and must not end it
+ * early - the reservation has to survive it. */
+TEST(qos2_publish_id_not_released_by_stray_puback)
+{
+    int rc;
+    int i;
+    MqttConnect connect;
+    MqttPublish publish;
+    static byte payload[] = "hello";
+    /* PUBREC for 0x2233: the client answers PUBREL and waits for PUBCOMP. */
+    static const byte pubrec[] = { 0x50, 0x02, 0x22, 0x33 };
+    /* A PUBACK naming the same identifier, which belongs to no QoS 1
+     * exchange on this connection. */
+    static const byte puback[] = { 0x40, 0x02, 0x22, 0x33 };
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+#ifdef WOLFMQTT_V5
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+#endif
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
+
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_canned;
+    XMEMCPY(g_canned_buf, pubrec, sizeof(pubrec));
+    g_canned_len = (int)sizeof(pubrec);
+    g_canned_pos = 0;
+
+    init_qos_publish(&publish, MQTT_QOS_2, 0x2233, "sensor/temp",
+        payload, (word32)(sizeof(payload) - 1));
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 20 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_Publish(&test_client, &publish);
+    }
+    /* No PUBCOMP, so the exchange is still open and the id still reserved. */
+    ASSERT_TRUE(rc != MQTT_CODE_SUCCESS);
+    ASSERT_EQ(1, send_id_reserved(0x2233));
+
+    /* Feed the stray PUBACK through the read path. */
+    XMEMCPY(g_canned_buf, puback, sizeof(puback));
+    g_canned_len = (int)sizeof(puback);
+    g_canned_pos = 0;
+    rc = MQTT_CODE_CONTINUE;
+    for (i = 0; i < 5 && rc == MQTT_CODE_CONTINUE; i++) {
+        rc = MqttClient_WaitMessage(&test_client, 10);
+    }
+
+    /* The QoS 2 exchange completes on PUBCOMP, so it is still outstanding. */
+    ASSERT_EQ(1, send_id_reserved(0x2233));
+}
+#endif /* WOLFMQTT_MAX_QOS >= 2 */
+
 /* A replay that fails on the transport must not leave the MqttConnect looking
  * like a resume. The bundled examples reuse one MqttConnect across reconnects,
  * so a leftover resume marker would make the replay the first packet of the
@@ -3280,10 +3569,13 @@ TEST(failed_replay_does_not_skip_next_connect)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
         payload, (word32)(sizeof(payload) - 1));
@@ -3334,10 +3626,13 @@ TEST(replay_resume_arms_keep_alive)
 
     rc = test_init_client();
     ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
-    test_client_connect_sent();
 #ifdef WOLFMQTT_V5
     test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
 #endif
+    /* Establish the Session before publishing: outbound Session state is
+     * bound to the ClientId that created it [MQTT-3.1.3-2], so a client that
+     * never completed a handshake has nothing to resume. */
+    ASSERT_EQ(MQTT_CODE_SUCCESS, run_initial_connect(&connect));
 
     init_qos_publish(&publish, MQTT_QOS_1, 0x1234, "sensor/temp",
         payload, (word32)(sizeof(payload) - 1));
@@ -6675,6 +6970,7 @@ void run_mqtt_client_tests(void)
     RUN_TEST(wait_message_puback_survives_shared_ack_overwrite);
 #endif
     RUN_TEST(net_connect_clears_connect_sent_flag);
+    RUN_TEST(publish_after_disconnect_rejected);
     RUN_TEST(reconnect_on_reused_connect_object_waits_for_connack);
 #ifndef WOLFMQTT_NO_SESSION_REPLAY
     RUN_TEST(reconnect_replays_unacked_qos1_publish);
@@ -6687,6 +6983,12 @@ void run_mqtt_client_tests(void)
     RUN_TEST(reconnect_replays_at_most_pool_size);
     RUN_TEST(reconnect_does_not_replay_streamed_publish);
     RUN_TEST(reconnect_dropped_replay_frees_packet_id);
+    RUN_TEST(reconnect_with_new_client_id_does_not_replay);
+    RUN_TEST(reconnect_replays_unacked_zero_length_payload);
+    RUN_TEST(reconnect_unreplayable_entry_frees_packet_id);
+#if WOLFMQTT_MAX_QOS >= 2
+    RUN_TEST(qos2_publish_id_not_released_by_stray_puback);
+#endif
     RUN_TEST(failed_replay_does_not_skip_next_connect);
 #ifdef WOLFMQTT_NONBLOCK
     RUN_TEST(replay_resume_arms_keep_alive);

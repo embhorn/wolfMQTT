@@ -327,6 +327,11 @@ typedef struct _MqttReplayMsg {
 typedef struct _MqttSendId {
     void*  owner;
     word16 packet_id;
+    /* MqttPacketType of the acknowledgement that ends this exchange (PUBACK,
+     * PUBCOMP, SUBACK or UNSUBACK), so a different response type naming the
+     * same identifier cannot release it early [MQTT-2.3.1-3].
+     * MQTT_PACKET_TYPE_RESERVED means "any". */
+    byte   ack_type;
 } MqttSendId;
 
 /* Client structure */

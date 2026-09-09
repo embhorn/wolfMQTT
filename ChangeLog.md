@@ -142,6 +142,38 @@
       completing its own read could previously overwrite it between the read
       lock being dropped and the send lock being taken, sending the later
       Packet Identifier twice and never the earlier one [MQTT-4.6.0-2] (#608)
+    - Outbound Session state is now bound to the ClientId that created it, so
+      a client object reused under a new ClientId no longer replays the
+      previous Session's messages into the new one when the server answers
+      Session Present = 1 [MQTT-3.1.3-2]
+    - A zero-byte QoS 1/2 PUBLISH is retained for replay. Section 3.3.3 allows
+      an empty payload and [MQTT-4.4.0-1] asks for it back like any other
+      unacknowledged message; it was previously treated as a payload that
+      could not be copied
+    - A v5 PUBLISH carrying properties is no longer retained for replay. The
+      pool stores no properties, so re-sending would strip Response Topic,
+      Correlation Data and the rest - a different message from the one the
+      server is waiting on. Retaining properties for replay is not implemented
+    - A replay entry that can never be re-sent (no retained payload) is dropped
+      on reconnect instead of holding its Packet Identifier for the life of the
+      connection, since no acknowledgement will release it [MQTT-2.3.1-3]
+    - The Packet Identifier reservation now records the acknowledgement that
+      ends its exchange, so a PUBACK naming a QoS 2 identifier cannot complete
+      it early [MQTT-2.3.1-3]. The reservation and its replay record are
+      released under one lock, closing a window where a publisher could reuse
+      the identifier in between and have the old ack delete the new exchange's
+      state
+    - The replay record is created before the PUBLISH reaches the wire. In
+      `WOLFMQTT_MULTITHREAD` builds a reader thread could otherwise process the
+      acknowledgement first, leaving an already-acknowledged message retained
+      and replayed after the next reconnect
+    - `MqttClient_Publish`, `MqttClient_Subscribe`, `MqttClient_Unsubscribe`
+      and `MqttClient_Ping` are refused after `MqttClient_Disconnect`
+      [MQTT-3.14.4-1]
+    - The duplicate-CONNECT guard reads the handshake flag under `lockClient`
+      rather than through `MqttClient_Flags`, which reports "no flags set" when
+      the lock cannot be taken and would have let a second CONNECT through
+      [MQTT-3.1.0-2]
     - `MqttClient_Connect` now resets the CONNACK wait state on the
       `MqttConnect` object it was given. Reusing one across reconnects - what
       the bundled examples do - left `mc_connect->ack` mid-read, so the second
