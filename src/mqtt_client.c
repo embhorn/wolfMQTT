@@ -719,6 +719,49 @@ static void MqttClient_Replay_Reset(MqttClient* client)
     }
     client->replayIdx = MQTT_MAX_REPLAY_MSGS;
 }
+
+/* Lock-taking wrappers for the callers that reach the store from outside the
+ * client lock. Keeping the #ifdef inside a helper avoids leaving a bare scope
+ * block behind at each call site in single-threaded builds. */
+static void MqttClient_Replay_AddSafe(MqttClient* client, MqttPublish* publish)
+{
+#ifdef WOLFMQTT_MULTITHREAD
+    if (wm_SemLock(&client->lockClient) != MQTT_CODE_SUCCESS) {
+        return;
+    }
+#endif
+    MqttClient_Replay_Add(client, publish);
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+}
+
+static void MqttClient_Replay_PubRelSentSafe(MqttClient* client,
+    word16 packet_id)
+{
+#ifdef WOLFMQTT_MULTITHREAD
+    if (wm_SemLock(&client->lockClient) != MQTT_CODE_SUCCESS) {
+        return;
+    }
+#endif
+    MqttClient_Replay_PubRelSent(client, packet_id);
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+}
+
+static void MqttClient_Replay_RemoveSafe(MqttClient* client, word16 packet_id)
+{
+#ifdef WOLFMQTT_MULTITHREAD
+    if (wm_SemLock(&client->lockClient) != MQTT_CODE_SUCCESS) {
+        return;
+    }
+#endif
+    MqttClient_Replay_Remove(client, packet_id);
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+}
 #endif /* !WOLFMQTT_NO_SESSION_REPLAY */
 
 /* Outbound Packet Identifier occupancy.
@@ -1288,15 +1331,7 @@ static int MqttClient_DecodePacket(MqttClient* client, byte* rx_buf,
                     MqttClient_SendIdRelease(client, packet_id);
                 #ifndef WOLFMQTT_NO_SESSION_REPLAY
                     /* Completely acknowledged, so it leaves Session state. */
-                #ifdef WOLFMQTT_MULTITHREAD
-                    if (wm_SemLock(&client->lockClient) == 0)
-                #endif
-                    {
-                        MqttClient_Replay_Remove(client, packet_id);
-                #ifdef WOLFMQTT_MULTITHREAD
-                        wm_SemUnlock(&client->lockClient);
-                #endif
-                    }
+                    MqttClient_Replay_RemoveSafe(client, packet_id);
                 #endif
                 }
             #ifdef WOLFMQTT_V5
@@ -1649,6 +1684,16 @@ static int MqttClient_HandlePacket(MqttClient* client,
                     }
                     wm_SemUnlock(&client->lockClient);
                 }
+            #endif
+                /* [MQTT-2.3.1-3] The Packet Identifier is available for
+                 * reuse once the exchange it belongs to is complete, and this
+                 * one is: no PUBREL and no PUBCOMP follow a rejecting PUBREC.
+                 * The message also leaves Session state - the server declined
+                 * it, so [MQTT-4.4.0-1] does not ask for it back after a
+                 * reconnect. */
+                MqttClient_SendIdRelease(client, packet_id);
+            #ifndef WOLFMQTT_NO_SESSION_REPLAY
+                MqttClient_Replay_RemoveSafe(client, packet_id);
             #endif
                 return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_PUBLISH_REJECTED);
             }
@@ -2378,16 +2423,8 @@ wait_again:
              * after a CleanSession 0 reconnect [MQTT-4.4.0-1]. */
             if (rc == MQTT_CODE_SUCCESS &&
                     mms_stat->ackPacketType == MQTT_PACKET_TYPE_PUBLISH_REL) {
-            #ifdef WOLFMQTT_MULTITHREAD
-                if (wm_SemLock(&client->lockClient) == 0)
-            #endif
-                {
-                    MqttClient_Replay_PubRelSent(client,
-                        mms_stat->ackPacketId);
-            #ifdef WOLFMQTT_MULTITHREAD
-                    wm_SemUnlock(&client->lockClient);
-            #endif
-                }
+                MqttClient_Replay_PubRelSentSafe(client,
+                    mms_stat->ackPacketId);
             }
         #endif
 
@@ -2685,6 +2722,100 @@ static int MqttConnect_HasRecvMax(const MqttConnect* mc_connect)
 #endif
 
 #ifndef WOLFMQTT_NO_SESSION_REPLAY
+/* Encode the replay packet for client->replay[client->replayIdx] into
+ * client->tx_buf. Returns the encoded length, 0 when the slot has nothing to
+ * send, or a negative error when the client lock could not be taken.
+ *
+ * When the entry cannot be rebuilt it is dropped here and its Packet
+ * Identifier is reported through dropped_id so the caller can release the
+ * reservation the reconnect took for it. That release cannot happen inside
+ * this function: MqttClient_SendIdRelease takes client->lockClient, which is
+ * held below and is not recursive.
+ *
+ * Takes client->lockClient because the receive path frees a slot as soon as
+ * its acknowledgement arrives: the slot fields, and the topic and payload
+ * buffers the encoder copies out of it, must not be read without it. The
+ * caller already holds lockSend, which is the lockSend -> lockClient order
+ * used everywhere else. */
+static int MqttClient_Replay_EncodeNext(MqttClient* client, word16* dropped_id)
+{
+    MqttReplayMsg* slot;
+    int rc = 0;
+    int keep = 0;
+
+    *dropped_id = 0;
+#ifdef WOLFMQTT_MULTITHREAD
+    rc = wm_SemLock(&client->lockClient);
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+#endif
+    slot = &client->replay[client->replayIdx];
+
+    /* Empty slots, and PUBLISHes whose payload could not be retained, have
+     * nothing to send. The entry is kept rather than dropped: the server may
+     * still acknowledge the message it stands for, and that acknowledgement
+     * is what releases both the slot and its Packet Identifier
+     * [MQTT-2.3.1-3]. */
+    if (slot->packet_id == 0 || (!slot->pubrelSent && !slot->haveCopy)) {
+        rc = 0;
+        keep = 1;
+    }
+    else if (slot->pubrelSent) {
+        MqttPublishResp rel;
+
+        XMEMSET(&rel, 0, sizeof(rel));
+        rel.packet_id = slot->packet_id;
+        rel.packet_type = MQTT_PACKET_TYPE_PUBLISH_REL;
+    #ifdef WOLFMQTT_V5
+        rel.protocol_level = client->protocol_level;
+    #endif
+        rc = MqttEncode_PublishResp(client->tx_buf, client->tx_buf_len,
+            MQTT_PACKET_TYPE_PUBLISH_REL, &rel);
+    }
+    else {
+        MqttPublish pub;
+
+        XMEMSET(&pub, 0, sizeof(pub));
+        pub.packet_id = slot->packet_id;
+        pub.qos = (MqttQoS)slot->qos;
+        pub.retain = slot->retain;
+        pub.duplicate = 1; /* [MQTT-3.3.1-1] */
+        pub.topic_name = slot->topic;
+        pub.buffer = slot->payload;
+        pub.buffer_len = slot->payload_len;
+        pub.total_len = slot->payload_len;
+    #ifdef WOLFMQTT_V5
+        pub.protocol_level = client->protocol_level;
+    #endif
+        rc = MqttEncode_Publish(client->tx_buf, client->tx_buf_len, &pub, 0);
+        /* MqttEncode_Publish declares the full Remaining Length in the fixed
+         * header but clamps the payload it copies to what tx_buf holds,
+         * leaving the remainder to MqttClient_Publish_WritePayload. The replay
+         * sends a single buffer and has no such second stage, so a clamped
+         * payload would put a short packet on the wire behind a longer
+         * declared length and desynchronize the stream. Drop it instead. */
+        if (rc > 0 && pub.buffer_pos != slot->payload_len) {
+            rc = 0;
+        }
+    }
+
+    if (rc <= 0 && !keep) {
+        /* Cannot rebuild this one (e.g. it no longer fits tx_buf). Drop it
+         * rather than stalling the rest of the replay, and report the
+         * identifier so the caller can give it back - nothing will ever
+         * acknowledge a message the client has abandoned. */
+        CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
+        *dropped_id = slot->packet_id;
+        MqttClient_Replay_FreeSlot(slot);
+        rc = 0;
+    }
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+    return rc;
+}
+
 /* Re-send the retained Session messages after a CleanSession 0 reconnect the
  * server answered with Session Present = 1. [MQTT-4.4.0-1] requires every
  * unacknowledged QoS > 0 PUBLISH and PUBREL to go out again with its original
@@ -2697,16 +2828,8 @@ static int MqttClient_ReplaySession(MqttClient* client,
     int rc = MQTT_CODE_SUCCESS;
 
     while (client->replayIdx < MQTT_MAX_REPLAY_MSGS) {
-        MqttReplayMsg* slot = &client->replay[client->replayIdx];
         int xfer;
-
-        /* Empty slots, and PUBLISHes whose payload could not be retained,
-         * have nothing to send. */
-        if (slot->packet_id == 0 ||
-                (!slot->pubrelSent && !slot->haveCopy)) {
-            client->replayIdx++;
-            continue;
-        }
+        word16 dropped_id;
 
         if (!mc_connect->stat.isWriteActive) {
             rc = MqttWriteStart(client, &mc_connect->stat);
@@ -2714,43 +2837,17 @@ static int MqttClient_ReplaySession(MqttClient* client,
                 return rc; /* MQTT_CODE_CONTINUE while another write runs */
             }
 
-            if (slot->pubrelSent) {
-                MqttPublishResp rel;
-
-                XMEMSET(&rel, 0, sizeof(rel));
-                rel.packet_id = slot->packet_id;
-                rel.packet_type = MQTT_PACKET_TYPE_PUBLISH_REL;
-            #ifdef WOLFMQTT_V5
-                rel.protocol_level = client->protocol_level;
-            #endif
-                rc = MqttEncode_PublishResp(client->tx_buf,
-                    client->tx_buf_len, MQTT_PACKET_TYPE_PUBLISH_REL, &rel);
-            }
-            else {
-                MqttPublish pub;
-
-                XMEMSET(&pub, 0, sizeof(pub));
-                pub.packet_id = slot->packet_id;
-                pub.qos = (MqttQoS)slot->qos;
-                pub.retain = slot->retain;
-                pub.duplicate = 1; /* [MQTT-3.3.1-1] */
-                pub.topic_name = slot->topic;
-                pub.buffer = slot->payload;
-                pub.buffer_len = slot->payload_len;
-                pub.total_len = slot->payload_len;
-            #ifdef WOLFMQTT_V5
-                pub.protocol_level = client->protocol_level;
-            #endif
-                rc = MqttEncode_Publish(client->tx_buf, client->tx_buf_len,
-                    &pub, 0);
-            }
+            rc = MqttClient_Replay_EncodeNext(client, &dropped_id);
             if (rc <= 0) {
-                /* Cannot rebuild this one (e.g. it no longer fits tx_buf).
-                 * Drop it rather than stalling the rest of the replay. */
-                CLIENT_FORCE_ZERO(client->tx_buf, client->tx_buf_len);
                 MqttWriteStop(client, &mc_connect->stat);
-                MqttClient_Replay_FreeSlot(slot);
-                client->replayIdx++;
+                if (rc < 0) {
+                    return rc; /* client lock failed */
+                }
+                /* Outside the client lock, which SendIdRelease takes. */
+                if (dropped_id != 0) {
+                    MqttClient_SendIdRelease(client, dropped_id);
+                }
+                client->replayIdx++; /* nothing to send from this slot */
                 continue;
             }
             client->write.len = rc;
@@ -2810,6 +2907,35 @@ static int MqttClient_CheckConnectSent(MqttClient *client)
     return MQTT_CODE_SUCCESS;
 }
 
+#ifndef WOLFMQTT_NO_TIME
+/* Apply the auto keep-alive decision once a connect attempt has reached a
+ * final result. Shared by the normal handshake tail and by the
+ * [MQTT-4.4.0-1] replay resume path, which returns to the caller before
+ * reaching that tail; must not be called for MQTT_CODE_CONTINUE, which would
+ * discard a v5 Server Keep Alive before the attempt has finished. */
+static void MqttClient_ConnectKeepAlive(MqttClient* client,
+    const MqttConnect* mc_connect, int rc)
+{
+    if (rc == MQTT_CODE_SUCCESS) {
+        /* Connection accepted: arm auto keep-alive. A v5 Server Keep Alive
+         * (applied while processing CONNACK) takes precedence, including a
+         * value of 0 which disables keep-alive per [MQTT-3.1.2.11.2];
+         * otherwise use the client-requested value. */
+        if (!client->keep_alive_from_server) {
+            client->keep_alive_sec = mc_connect->keep_alive_sec;
+        }
+        /* Baseline the idle timer from the completed handshake so the first
+         * ping is scheduled a full interval out, not immediately. */
+        client->last_tx_time = WOLFMQTT_GET_TIME_S();
+    }
+    else {
+        /* Connect failed or was refused: leave the scheduler disarmed. */
+        client->keep_alive_sec = 0;
+    }
+    client->keep_alive_from_server = 0;
+}
+#endif
+
 int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 {
     int rc;
@@ -2826,13 +2952,29 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 
 #ifndef WOLFMQTT_NO_SESSION_REPLAY
     if (mc_connect->stat.write == MQTT_MSG_PAYLOAD) {
-        /* Resuming the [MQTT-4.4.0-1] replay this call started earlier; the
-         * handshake below is already done. */
-        rc = MqttClient_ReplaySession(client, mc_connect);
-        if (rc == MQTT_CODE_SUCCESS) {
-            mc_connect->stat.write = MQTT_MSG_BEGIN;
+        /* MQTT_MSG_PAYLOAD is not part of the CONNECT write sequence
+         * (MQTT_MSG_BEGIN -> MQTT_MSG_HEADER -> MQTT_MSG_AUTH/MQTT_MSG_WAIT);
+         * it marks an [MQTT-4.4.0-1] replay this call started earlier and did
+         * not finish. The CONNECT_SENT check pairs the sentinel with the
+         * Network Connection it was set on, so one left behind by a failed
+         * replay cannot make the replay the first packet of a new connection
+         * [MQTT-3.1.0-1]. */
+        if (MqttClient_CheckConnectSent(client) == MQTT_CODE_SUCCESS) {
+            rc = MqttClient_ReplaySession(client, mc_connect);
+            if (rc != MQTT_CODE_CONTINUE) {
+                /* Finished, either way: clear the sentinel so a failed replay
+                 * cannot bypass the handshake on the next call, and settle
+                 * the keep-alive scheduler the tail of this function never
+                 * reached. */
+                mc_connect->stat.write = MQTT_MSG_BEGIN;
+            #ifndef WOLFMQTT_NO_TIME
+                MqttClient_ConnectKeepAlive(client, mc_connect, rc);
+            #endif
+            }
+            return rc;
         }
-        return rc;
+        /* Stale sentinel on a fresh Network Connection: start over. */
+        mc_connect->stat.write = MQTT_MSG_BEGIN;
     }
 #endif
 
@@ -3182,6 +3324,16 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
     /* reset state */
     mc_connect->stat.write = MQTT_MSG_BEGIN;
 
+    /* The CONNACK exchange is finished, so its wait state must not carry into
+     * a later handshake on the same object - the bundled examples reuse one
+     * MqttConnect across reconnects. MqttClient_WaitType dispatches on the
+     * stat of the object it was given, here mc_connect->ack: left at
+     * MQTT_MSG_PAYLOAD it would skip the read on the next call and hand
+     * whatever is still in rx_buf to the PUBLISH payload handler instead of
+     * waiting for the new CONNACK. */
+    mc_connect->ack.stat.read = MQTT_MSG_BEGIN;
+    mc_connect->ack.stat.ack = MQTT_MSG_BEGIN;
+
     /* CONNACK was received and decoded, but the broker refused the
      * connection. The specific reason is in mc_connect->ack.return_code
      * (MqttConnectAckReturnCodes for v3.1.1, MqttReasonCodes for v5). */
@@ -3246,34 +3398,22 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
             client->replayIdx = 0;
             mc_connect->stat.write = MQTT_MSG_PAYLOAD;
             rc = MqttClient_ReplaySession(client, mc_connect);
-            if (rc == MQTT_CODE_SUCCESS) {
-                mc_connect->stat.write = MQTT_MSG_BEGIN;
-            }
-            else {
+            if (rc == MQTT_CODE_CONTINUE) {
+                /* The application re-enters through the resume block at the
+                 * top of this function, which arms keep-alive when the replay
+                 * finally completes. */
                 return rc;
             }
+            /* Clear the resume sentinel on success and on failure alike: a
+             * failed replay must not leave an MqttConnect that a later call
+             * would mistake for a resume and use to skip the handshake. */
+            mc_connect->stat.write = MQTT_MSG_BEGIN;
         }
     }
 #endif
 
 #ifndef WOLFMQTT_NO_TIME
-    if (rc == MQTT_CODE_SUCCESS) {
-        /* Connection accepted: arm auto keep-alive. A v5 Server Keep Alive
-         * (applied while processing CONNACK) takes precedence, including a
-         * value of 0 which disables keep-alive per [MQTT-3.1.2.11.2];
-         * otherwise use the client-requested value. */
-        if (!client->keep_alive_from_server) {
-            client->keep_alive_sec = mc_connect->keep_alive_sec;
-        }
-        /* Baseline the idle timer from the completed handshake so the first
-         * ping is scheduled a full interval out, not immediately. */
-        client->last_tx_time = WOLFMQTT_GET_TIME_S();
-    }
-    else {
-        /* Connect failed or was refused: leave the scheduler disarmed. */
-        client->keep_alive_sec = 0;
-    }
-    client->keep_alive_from_server = 0;
+    MqttClient_ConnectKeepAlive(client, mc_connect, rc);
 #endif
 
     return rc;
@@ -3818,15 +3958,7 @@ static int MqttPublishMsg(MqttClient *client, MqttPublish *publish,
             /* The PUBLISH is on the wire and unacknowledged, so it is now
              * Session state the client must be able to re-send after a
              * CleanSession 0 reconnect [MQTT-4.4.0-1]. */
-        #ifdef WOLFMQTT_MULTITHREAD
-            if (wm_SemLock(&client->lockClient) == 0)
-        #endif
-            {
-                MqttClient_Replay_Add(client, publish);
-        #ifdef WOLFMQTT_MULTITHREAD
-                wm_SemUnlock(&client->lockClient);
-        #endif
-            }
+            MqttClient_Replay_AddSafe(client, publish);
         #endif
 
             publish->stat.write = MQTT_MSG_WAIT;

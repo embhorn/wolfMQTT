@@ -350,12 +350,14 @@ typedef struct _MqttMsgStat {
      * being dropped and the send lock being taken. Kept as the encodable
      * fields rather than a whole MqttPublishResp, which embeds this struct.
      * ackPacketType is MQTT_PACKET_TYPE_RESERVED when nothing is staged. */
+#ifdef WOLFMQTT_V5
+    MqttProp* ackProps;
+#endif
     word16 ackPacketId;
     byte   ackPacketType;
 #ifdef WOLFMQTT_V5
     byte   ackReasonCode;
     byte   ackProtocolLevel;
-    MqttProp* ackProps;
 #endif
 } MqttMsgStat;
 
@@ -509,8 +511,10 @@ typedef struct _MqttConnect {
      * Binary Data, which may legally contain 0x00, so a NUL-terminated string
      * cannot express every valid value. Leave 0 to keep the original
      * behaviour of measuring `password` with XSTRLEN; set it to send binary
-     * password bytes verbatim. Added at the end of the struct so existing
-     * binaries keep their layout. */
+     * password bytes verbatim. MqttDecode_Connect reports the wire length
+     * here. Added at the end of the struct so the offsets of the existing
+     * members are unchanged; sizeof(MqttConnect) still grows, so a caller
+     * must be rebuilt against this header rather than relinked against it. */
     word16      password_len;
 } MqttConnect;
 

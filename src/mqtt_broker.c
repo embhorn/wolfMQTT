@@ -1119,17 +1119,21 @@ static int callback_broker_mqtt(struct lws *wsi,
         if (bc_ptr == NULL || *bc_ptr == NULL) return 0;
         bc = *bc_ptr;
         ws = (BrokerWsCtx*)bc->ws_ctx;
-        if (ws == NULL || in == NULL || len == 0) return 0;
+        if (ws == NULL) return 0;
 
         /* [MQTT-6.0.0-1] MQTT over WebSocket is carried in binary data
          * frames: "If any other type of data frame is received the recipient
          * MUST close the Network Connection." A text frame's payload is not
-         * an MQTT byte stream, so it must never reach the packet parser. */
+         * an MQTT byte stream, so it must never reach the packet parser. The
+         * rule is about the frame type, not its payload, so this runs before
+         * the empty-frame check below - an empty text frame must close the
+         * connection too. */
         if (!lws_frame_is_binary(wsi)) {
             WBLOG_ERR(broker, "broker: ws non-binary data frame wsi=%p "
                 "[MQTT-6.0.0-1]", (void*)wsi);
             return -1; /* close connection */
         }
+        if (in == NULL || len == 0) return 0;
 
         /* Append data to rx_buffer */
         if (ws->rx_len + len <= sizeof(ws->rx_buffer)) {
@@ -2168,7 +2172,8 @@ static int BrokerClient_DrainOutQueue(BrokerClient* bc)
                      * as the MQTT_CODE_CONTINUE case above. */
                     cur->retransmit_dup = 1;
                 }
-                else if (bc->client.write.pos > 0) {
+                else if (bc->client.write.pos > 0 &&
+                        wr_rc != MQTT_CODE_ERROR_TIMEOUT) {
                     /* MQTT 3.1.1 section 4.3.1: at QoS 0 "no retry is
                      * performed by the sender" and the message "arrives at the
                      * receiver either once or not at all". Bytes of this
@@ -2177,7 +2182,20 @@ static int BrokerClient_DrainOutQueue(BrokerClient* bc)
                      * and be sent a second time after reconnect. Section 4.1
                      * makes only QoS 0 messages *pending transmission*
                      * optional Session state, and this one is no longer
-                     * pending - drop it. */
+                     * pending - drop it.
+                     *
+                     * MQTT_CODE_ERROR_TIMEOUT is excluded because it is not a
+                     * dead socket: BrokerPosix_Write returns it when select()
+                     * merely times out. Dropping the entry there would clear
+                     * client.write.pos, so a caller that keeps the connection
+                     * (the fan-out drains discard this return value) would
+                     * write the next queued PUBLISH straight behind the
+                     * truncated prefix and the subscriber would parse its head
+                     * as the previous packet's payload. The entry stays queued
+                     * and the drain resumes from write.pos instead. The main
+                     * loop still tears the connection down on this result, and
+                     * the orphan hand-off then drops the half-sent QoS 0 entry
+                     * for the same section 4.3.1 reason. */
                     BrokerOutPub* free_me = cur;
 
                     if (prev == NULL) {
@@ -3604,6 +3622,44 @@ static BrokerOrphanSession* BrokerOrphan_Take(MqttBroker* broker,
     o->session_expiry_sec = bc->session_expiry_sec;
     o->orphan_since = WOLFMQTT_BROKER_GET_TIME_S();
 
+    /* A QoS 0 PUBLISH whose bytes are partly on the wire is no longer
+     * "pending transmission", so MQTT 3.1.1 section 4.1 does not carry it into
+     * the Session and section 4.3.1 forbids a retry. Drop it here rather than
+     * let it follow the orphan and be delivered a second time after reconnect.
+     *
+     * client.write.pos is the offset into the entry the drain was writing,
+     * which is the first one still in BROKER_OUTQ_QUEUED - not necessarily
+     * out_q_head. BrokerClient_DrainOutQueue walks past entries in
+     * PUBLISH_SENT / PUBREL_SENT (QoS > 0 awaiting an acknowledgement), and
+     * those stay linked ahead of it. */
+    if (bc->client.write.pos > 0) {
+        BrokerOutPub* partial = bc->out_q_head;
+        BrokerOutPub* partial_prev = NULL;
+
+        while (partial != NULL && partial->state != BROKER_OUTQ_QUEUED) {
+            partial_prev = partial;
+            partial = partial->next;
+        }
+        if (partial != NULL && partial->qos == MQTT_QOS_0) {
+            if (partial_prev == NULL) {
+                bc->out_q_head = partial->next;
+            }
+            else {
+                partial_prev->next = partial->next;
+            }
+            if (bc->out_q_tail == partial) {
+                bc->out_q_tail = partial_prev;
+            }
+            bc->out_q_count--;
+            WBLOG_DBG(broker,
+                "broker: dropping partially sent qos0 topic=%s client_id=%s",
+                BrokerLog_Sanitize(partial->topic),
+                BrokerLog_Sanitize(bc->client_id));
+            BrokerOutPub_Free(partial);
+            bc->client.write.pos = 0;
+        }
+    }
+
     /* Move out_q ownership. bc->out_q_* must be cleared so
      * BrokerClient_FreeOutQueue (called from BrokerClient_Free)
      * doesn't double-free. */
@@ -4436,9 +4492,9 @@ static void BrokerStaticOutId_Release(BrokerClient* bc, word16 packet_id,
     }
     for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
         if (bc->out_inflight[i].packet_id == packet_id &&
-                bc->out_inflight[i].qos == qos) {
+                bc->out_inflight[i].qos == (byte)qos) {
             bc->out_inflight[i].packet_id = 0;
-            bc->out_inflight[i].qos = MQTT_QOS_0;
+            bc->out_inflight[i].qos = (byte)MQTT_QOS_0;
             return;
         }
     }
@@ -4455,6 +4511,9 @@ static word16 BrokerStaticOutId_Take(MqttBroker* broker, BrokerClient* bc,
     word16 first;
     int i;
 
+    if (broker == NULL || bc == NULL) {
+        return 0;
+    }
     for (i = 0; i < BROKER_MAX_INFLIGHT_PER_SUB; i++) {
         if (bc->out_inflight[i].packet_id == 0) {
             break;
@@ -4476,7 +4535,7 @@ static word16 BrokerStaticOutId_Take(MqttBroker* broker, BrokerClient* bc,
                 broker->next_packet_id = 1;
             }
             bc->out_inflight[i].packet_id = candidate;
-            bc->out_inflight[i].qos = qos;
+            bc->out_inflight[i].qos = (byte)qos;
             return candidate;
         }
         candidate++;
@@ -5546,12 +5605,13 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
             out_pub.buffer = (rm->payload_len > 0) ? rm->payload : NULL;
             out_pub.total_len = rm->payload_len;
             if (eff_qos >= MQTT_QOS_1) {
-                out_pub.packet_id = BrokerStaticOutId_Take(broker, bc, eff_qos);
+                out_pub.packet_id = BrokerStaticOutId_Take(broker, bc,
+                    eff_qos);
                 if (out_pub.packet_id == 0) {
-            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
-             * because every one is still awaiting its acknowledgement.
-             * Reusing one would make the pending exchange ambiguous, so skip
-             * this delivery instead. */
+                    /* [MQTT-2.3.1-4] No identifier is free for this
+                     * subscriber because every one is still awaiting its
+                     * acknowledgement. Reusing one would make the pending
+                     * exchange ambiguous, so skip this delivery instead. */
                     WBLOG_ERR(broker, "broker: static retained delivery "
                         "dropped sock=%d (no free packet id)", (int)bc->sock);
                     continue;
@@ -5578,6 +5638,14 @@ static int BrokerRetained_DeliverToClient(MqttBroker* broker,
                     /* Scrub the retained (possibly retained-will) payload from
                      * the subscriber tx_buf, mirroring the will fan-out. */
                     BROKER_FORCE_ZERO(bc->tx_buf, enc_rc);
+                }
+                if (wr_rc != MQTT_CODE_CONTINUE && wr_rc != enc_rc &&
+                        eff_qos >= MQTT_QOS_1) {
+                    /* The write failed outright, so the delivery is over and
+                     * no acknowledgement can release the identifier. This
+                     * path leaves the subscriber connected, so holding the
+                     * slot would leak it [MQTT-2.3.1-3]. */
+                    BrokerStaticOutId_Release(bc, out_pub.packet_id, eff_qos);
                 }
             }
             else {
@@ -5877,12 +5945,13 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                 out_pub.buffer = (payload_len > 0) ? (byte*)payload : NULL;
                 out_pub.total_len = payload_len;
                 if (eff_qos >= MQTT_QOS_1) {
-                    out_pub.packet_id = BrokerStaticOutId_Take(broker, wc, eff_qos);
+                    out_pub.packet_id = BrokerStaticOutId_Take(broker, wc,
+                        eff_qos);
                     if (out_pub.packet_id == 0) {
-            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
-             * because every one is still awaiting its acknowledgement.
-             * Reusing one would make the pending exchange ambiguous, so skip
-             * this delivery instead. */
+                        /* [MQTT-2.3.1-4] No identifier is free for this
+                         * subscriber because every one is still awaiting its
+                         * acknowledgement. Reusing one would make the pending
+                         * exchange ambiguous, so skip this delivery. */
                         WBLOG_ERR(broker, "broker: static delivery dropped "
                             "sock=%d (no free packet id)", (int)wc->sock);
                         continue;
@@ -5899,11 +5968,18 @@ static void BrokerClient_PublishWillImmediate(MqttBroker* broker,
                     if (wr_rc != MQTT_CODE_CONTINUE) {
                         BROKER_FORCE_ZERO(wc->tx_buf, enc_rc);
                     }
+                    if (wr_rc != MQTT_CODE_CONTINUE && wr_rc != enc_rc &&
+                            eff_qos >= MQTT_QOS_1) {
+                        /* Write failed and the subscriber stays connected, so
+                         * nothing else will release the identifier. */
+                        BrokerStaticOutId_Release(wc, out_pub.packet_id,
+                            eff_qos);
+                    }
                 }
                 else {
                     /* The PUBLISH never reached the wire, so no PUBACK or
-                     * PUBCOMP will ever release the identifier. Give the slot back
-                     * now [MQTT-2.3.1-3]. */
+                     * PUBCOMP will ever release the identifier. Give the slot
+                     * back now [MQTT-2.3.1-3]. */
                     BrokerStaticOutId_Release(wc, out_pub.packet_id, eff_qos);
                 }
             }
@@ -6592,35 +6668,34 @@ static int BrokerHandle_Connect(BrokerClient* bc, int rx_len,
         }
     }
     if (mc.password) {
-        word16 plen = 0;
-        if (MqttDecode_Num((byte*)mc.password - MQTT_DATA_LEN_SIZE,
-                &plen, MQTT_DATA_LEN_SIZE) == MQTT_DATA_LEN_SIZE) {
-        #ifdef WOLFMQTT_STATIC_MEMORY
-            if (plen >= BROKER_MAX_PASSWORD_LEN) {
-                WBLOG_ERR(broker,
-                    "broker: password too long (%u >= %d) sock=%d",
-                    (unsigned)plen, BROKER_MAX_PASSWORD_LEN,
-                    (int)bc->sock);
-            #ifdef WOLFMQTT_V5
-                if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
-                    ack.return_code = MQTT_REASON_BAD_USER_OR_PASS;
-                }
-                else
-            #endif
-                {
-                    ack.return_code =
-                        MQTT_CONNECT_ACK_CODE_REFUSED_BAD_USER_PWD;
-                }
-                goto send_connack;
+        /* [MQTT-3.1.3.5] Password is Binary Data, so its length comes from
+         * the wire (MqttDecode_Connect reports it in password_len), not from
+         * XSTRLEN over a pointer into a rx_buf that is not NUL terminated. */
+        word16 plen = mc.password_len;
+    #ifdef WOLFMQTT_STATIC_MEMORY
+        if (plen >= BROKER_MAX_PASSWORD_LEN) {
+            WBLOG_ERR(broker,
+                "broker: password too long (%u >= %d) sock=%d",
+                (unsigned)plen, BROKER_MAX_PASSWORD_LEN,
+                (int)bc->sock);
+        #ifdef WOLFMQTT_V5
+            if (mc.protocol_level >= MQTT_CONNECT_PROTOCOL_LEVEL_5) {
+                ack.return_code = MQTT_REASON_BAD_USER_OR_PASS;
             }
+            else
         #endif
-            /* [MQTT-3.1.3.5] Password is Binary Data and may legally
-             * contain 0x00. The binary-sensitive store records the
-             * actual length in bc->password_len so wipe and compare
-             * paths don't fall back to XSTRLEN truncation. */
-            BROKER_STORE_BIN_SENSITIVE(bc->password, bc->password_len,
-                mc.password, plen, BROKER_MAX_PASSWORD_LEN);
+            {
+                ack.return_code =
+                    MQTT_CONNECT_ACK_CODE_REFUSED_BAD_USER_PWD;
+            }
+            goto send_connack;
         }
+    #endif
+        /* The binary-sensitive store records the actual length in
+         * bc->password_len so wipe and compare paths don't fall back to
+         * XSTRLEN truncation. */
+        BROKER_STORE_BIN_SENSITIVE(bc->password, bc->password_len,
+            mc.password, plen, BROKER_MAX_PASSWORD_LEN);
     }
     if (broker->auth_user || broker->auth_pass) {
         int auth_ok = 1;
@@ -7756,10 +7831,10 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                     out_pub.packet_id = BrokerStaticOutId_Take(broker,
                         sub->client, eff_qos);
                     if (out_pub.packet_id == 0) {
-            /* [MQTT-2.3.1-4] No identifier is free for this subscriber
-             * because every one is still awaiting its acknowledgement.
-             * Reusing one would make the pending exchange ambiguous, so skip
-             * this delivery instead. */
+                        /* [MQTT-2.3.1-4] No identifier is free for this
+                         * subscriber because every one is still awaiting its
+                         * acknowledgement. Reusing one would make the pending
+                         * exchange ambiguous, so skip this delivery. */
                         WBLOG_ERR(broker, "broker: static live delivery "
                             "dropped sock=%d (no free packet id)",
                             (int)sub->client->sock);
@@ -7795,8 +7870,8 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
                 }
                 else {
                     /* The PUBLISH never reached the wire, so no PUBACK or
-                     * PUBCOMP will ever release the identifier. Give the slot back
-                     * now [MQTT-2.3.1-3]. */
+                     * PUBCOMP will ever release the identifier. Give the slot
+                     * back now [MQTT-2.3.1-3]. */
                     BrokerStaticOutId_Release(sub->client, out_pub.packet_id,
                         eff_qos);
                     WBLOG_ERR(broker,
@@ -8124,6 +8199,9 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
             reason_code >= 0x80) {
         /* A rejecting PUBREC ends this delivery; no PUBREL follows. */
     #ifdef WOLFMQTT_STATIC_MEMORY
+        /* No PUBCOMP will ever arrive for this identifier, so give the slot
+         * back now or the subscriber runs out of them [MQTT-2.3.1-4]. */
+        BrokerStaticOutId_Release(bc, resp.packet_id, MQTT_QOS_2);
         BrokerStaticOrphan_OnPubReject(bc->broker, bc, resp.packet_id);
     #else
         BrokerClient_OnPubReject(bc, resp.packet_id);
@@ -8519,7 +8597,8 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                 #ifdef WOLFMQTT_STATIC_MEMORY
                     /* [MQTT-2.3.1-3] PUBACK completes the QoS 1 exchange, so
                      * the identifier is free for the next delivery. */
-                    BrokerStaticOutId_Release(bc, ack_resp.packet_id, MQTT_QOS_1);
+                    BrokerStaticOutId_Release(bc, ack_resp.packet_id,
+                        MQTT_QOS_1);
                     BrokerStaticOrphan_OnPubAck(broker, bc,
                         ack_resp.packet_id);
                 #else
@@ -8576,7 +8655,8 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                 if (comp_rc >= 0) {
                 #ifdef WOLFMQTT_STATIC_MEMORY
                     /* [MQTT-2.3.1-3] PUBCOMP completes the QoS 2 exchange. */
-                    BrokerStaticOutId_Release(bc, comp_resp.packet_id, MQTT_QOS_2);
+                    BrokerStaticOutId_Release(bc, comp_resp.packet_id,
+                        MQTT_QOS_2);
                     BrokerStaticOrphan_OnPubComp(broker, bc,
                         comp_resp.packet_id);
                 #else

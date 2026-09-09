@@ -274,6 +274,12 @@ typedef struct _MqttSk {
 #ifndef MQTT_MAX_REPLAY_MSGS
     #define MQTT_MAX_REPLAY_MSGS 4
 #endif
+/* A zero-length array is a GNU extension, not C89, and would silently disable
+ * the store rather than fail the build. Use WOLFMQTT_NO_SESSION_REPLAY to
+ * remove it deliberately. */
+#if (MQTT_MAX_REPLAY_MSGS < 1) || (MQTT_MAX_REPLAY_MSGS > 65535)
+    #error "MQTT_MAX_REPLAY_MSGS must be between 1 and 65535"
+#endif
 #ifdef WOLFMQTT_STATIC_MEMORY
     /* Bounds of the in-struct copies when there is no allocator. */
     #ifndef MQTT_MAX_REPLAY_TOPIC
@@ -281,6 +287,14 @@ typedef struct _MqttSk {
     #endif
     #ifndef MQTT_MAX_REPLAY_PAYLOAD
         #define MQTT_MAX_REPLAY_PAYLOAD 256
+    #endif
+    /* The topic copy is NUL terminated, so it needs room for the terminator
+     * plus at least one character [MQTT-4.7.3-1]. */
+    #if (MQTT_MAX_REPLAY_TOPIC < 2) || (MQTT_MAX_REPLAY_TOPIC > 65536)
+        #error "MQTT_MAX_REPLAY_TOPIC must be between 2 and 65536"
+    #endif
+    #if (MQTT_MAX_REPLAY_PAYLOAD < 1)
+        #error "MQTT_MAX_REPLAY_PAYLOAD must be at least 1"
     #endif
 #endif
 

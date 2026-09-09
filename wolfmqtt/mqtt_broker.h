@@ -571,7 +571,7 @@ typedef struct BrokerOrphanSession {
 /* One outbound QoS > 0 delivery this client has not acknowledged yet. */
 typedef struct BrokerStaticOutId {
     word16  packet_id;      /* 0 = empty slot */
-    MqttQoS qos;            /* QoS the delivery went out with */
+    byte    qos;            /* MqttQoS the delivery went out with */
 } BrokerStaticOutId;
 
 typedef struct BrokerClient {

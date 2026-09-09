@@ -1428,6 +1428,7 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
 #endif
     MqttConnectPacket packet = MQTT_CONNECT_INIT;
     byte *tx_payload;
+    word16 password_len = 0;
 
     /* Validate required arguments */
     if (tx_buf == NULL || mc_connect == NULL || mc_connect->client_id == NULL) {
@@ -1593,13 +1594,16 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
     if (mc_connect->password) {
         /* [MQTT-3.1.3.5] Password is Binary Data. An explicit password_len
          * carries bytes that XSTRLEN would truncate at an embedded 0x00; 0
-         * keeps the original NUL-terminated behaviour. */
+         * keeps the original NUL-terminated behaviour. Computed once here and
+         * reused by the payload pass below, which must agree with what
+         * remain_len reserved. */
         size_t str_len = (mc_connect->password_len > 0) ?
             (size_t)mc_connect->password_len :
             XSTRLEN(mc_connect->password);
         if (str_len > (size_t)0xFFFF) {
             return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
         }
+        password_len = (word16)str_len;
         remain_len += (int)str_len + MQTT_DATA_LEN_SIZE;
     }
 
@@ -1700,9 +1704,7 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
          * and matches the decode path, which reads it as raw bytes. The length
          * bound was already enforced above. */
         tx_payload += MqttEncode_Data(tx_payload,
-            (const byte*)mc_connect->password,
-            (mc_connect->password_len > 0) ? mc_connect->password_len :
-                (word16)XSTRLEN(mc_connect->password));
+            (const byte*)mc_connect->password, password_len);
     }
     (void)tx_payload;
 
@@ -1774,6 +1776,7 @@ int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
         (packet.flags & MQTT_CONNECT_FLAG_WILL_FLAG) ? 1 : 0;
     mc_connect->username = NULL;
     mc_connect->password = NULL;
+    mc_connect->password_len = 0;
 #ifdef WOLFMQTT_V5
     mc_connect->props = NULL;
     if (mc_connect->enable_lwt && mc_connect->lwt_msg != NULL) {
@@ -2016,6 +2019,11 @@ int MqttDecode_Connect(byte *rx_buf, int rx_buf_len, MqttConnect *mc_connect)
             goto cleanup;
         }
         mc_connect->password = (char*)(rx_payload + tmp);
+        /* [MQTT-3.1.3.5] The Password is Binary Data and the decoded pointer
+         * is into rx_buf, which is not NUL terminated. Report the wire length
+         * so a caller re-encoding this CONNECT does not fall back to XSTRLEN
+         * and truncate at an embedded 0x00 or read past the buffer. */
+        mc_connect->password_len = plen;
         rx_payload += tmp + plen;
     }
 

@@ -1895,6 +1895,33 @@ TEST(decode_connack_v5_longer_remain_len_accepted)
 #endif /* WOLFMQTT_V5 */
 
 #ifdef WOLFMQTT_V5
+/* The strict v3.1.1 length rule keys off connect_ack->protocol_level, which
+ * MqttConnectAck otherwise only carries as output. A caller that hands in a
+ * zeroed struct is therefore treated as v3.1.1, so a v5-shaped CONNACK is
+ * rejected as malformed. Pin that contract: the in-tree client always sets
+ * protocol_level first (src/mqtt_client.c), and an external caller decoding a
+ * v5 CONNACK must do the same. */
+TEST(decode_connack_v5_shape_without_protocol_level_rejected)
+{
+    byte buf[] = { 0x20, 0x03, 0x00, MQTT_REASON_SUCCESS, 0x00 };
+    MqttConnectAck ack;
+    int rc;
+
+    XMEMSET(&ack, 0, sizeof(ack));
+    ASSERT_EQ(0, (int)ack.protocol_level);
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(MQTT_CODE_ERROR_MALFORMED_DATA, rc);
+
+    /* Same bytes, protocol level supplied: accepted. */
+    XMEMSET(&ack, 0, sizeof(ack));
+    ack.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    rc = MqttDecode_ConnectAck(buf, (int)sizeof(buf), &ack);
+    ASSERT_EQ(5, rc);
+    MqttProps_Free(ack.props);
+}
+#endif /* WOLFMQTT_V5 */
+
+#ifdef WOLFMQTT_V5
 /* MQTT 5.0 section 3.2.2.3: the Property Length belongs to this CONNACK,
  * so bytes after its declared Remaining Length cannot satisfy the property
  * block. The trailing bytes form a valid Maximum QoS property deliberately. */
@@ -2788,6 +2815,133 @@ TEST(encode_connect_password_len_zero_uses_strlen)
         ASSERT_EQ(off + 4, rc);
     }
 }
+
+/* password_len is the Password length regardless of protocol level, so the
+ * v5 encoder must honour it too [MQTT-3.1.3.5]. Same payload shape as the
+ * v3.1.1 case plus the CONNECT Properties length byte. */
+#ifdef WOLFMQTT_V5
+TEST(encode_connect_v5_binary_password_with_len_not_truncated)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    static const char password[] = { 'A', '\0', 'B', '\0' };
+    int rc;
+    int off;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    conn.clean_session = 1;
+    conn.username = "user";
+    conn.password = password;
+    conn.password_len = 3;
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+
+    /* 2 fixed header + 10 variable header + 1 property length + ClientId
+     * (2+3) + User Name (2+4). */
+    off = 2 + 10 + 1 + 2 + 3 + 2 + 4;
+    ASSERT_EQ(0x00, (int)tx_buf[off]);
+    ASSERT_EQ(0x03, (int)tx_buf[off + 1]);
+    ASSERT_EQ('A',  (int)tx_buf[off + 2]);
+    ASSERT_EQ(0x00, (int)tx_buf[off + 3]);
+    ASSERT_EQ('B',  (int)tx_buf[off + 4]);
+    ASSERT_EQ(off + 5, rc);
+}
+#endif /* WOLFMQTT_V5 */
+
+/* password_len describes `password`; with no password there is no Password
+ * field and the Password flag must stay clear, whatever the field says. */
+TEST(encode_connect_password_len_without_password_ignored)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "cid";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    conn.clean_session = 1;
+    conn.username = "user";
+    conn.password = NULL;
+    conn.password_len = 3;
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+    /* 2 fixed header + 10 variable header + ClientId (2+3) + User Name (2+4),
+     * and nothing after it. */
+    ASSERT_EQ(2 + 10 + 2 + 3 + 2 + 4, rc);
+    /* [MQTT-3.1.2-20] Password Flag (bit 6) must be 0 when absent. */
+    ASSERT_EQ(0, (int)(tx_buf[9] & 0x40));
+}
+
+#ifdef WOLFMQTT_BROKER
+/* MqttDecode_Connect must report the wire Password length: the decoded
+ * pointer is into rx_buf, which is not NUL terminated, so a caller that
+ * re-encodes the CONNECT would otherwise fall back to XSTRLEN and either
+ * truncate at an embedded 0x00 or read past the buffer [MQTT-3.1.3.5]. */
+TEST(decode_connect_reports_password_len)
+{
+    byte tx_buf[256];
+    MqttConnect enc;
+    MqttConnect dec;
+    MqttMessage lwt;
+    static const char password[] = { 'A', '\0', 'B', '\0' };
+    int rc;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.client_id = "cid";
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    enc.clean_session = 1;
+    enc.username = "user";
+    enc.password = password;
+    enc.password_len = 3;
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &enc);
+    ASSERT_TRUE(rc > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    /* Pre-set it to a wrong value: the decoder must overwrite, and must also
+     * clear it when no Password is present. */
+    dec.password_len = 0xFFFF;
+    ASSERT_TRUE(MqttDecode_Connect(tx_buf, rc, &dec) > 0);
+    ASSERT_NOT_NULL(dec.password);
+    ASSERT_EQ(3, (int)dec.password_len);
+    ASSERT_EQ('A', (int)((byte*)dec.password)[0]);
+    ASSERT_EQ(0x00, (int)((byte*)dec.password)[1]);
+    ASSERT_EQ('B', (int)((byte*)dec.password)[2]);
+}
+
+/* The same CONNECT without a Password must leave password_len at 0, so a
+ * reused MqttConnect cannot carry a stale length into the next encode. */
+TEST(decode_connect_without_password_clears_password_len)
+{
+    byte tx_buf[256];
+    MqttConnect enc;
+    MqttConnect dec;
+    MqttMessage lwt;
+    int rc;
+
+    XMEMSET(&enc, 0, sizeof(enc));
+    enc.client_id = "cid";
+    enc.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
+    enc.clean_session = 1;
+
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &enc);
+    ASSERT_TRUE(rc > 0);
+
+    XMEMSET(&dec, 0, sizeof(dec));
+    XMEMSET(&lwt, 0, sizeof(lwt));
+    dec.lwt_msg = &lwt;
+    dec.password_len = 0xFFFF;
+    ASSERT_TRUE(MqttDecode_Connect(tx_buf, rc, &dec) > 0);
+    ASSERT_NULL(dec.password);
+    ASSERT_EQ(0, (int)dec.password_len);
+}
+#endif /* WOLFMQTT_BROKER */
 
 TEST(encode_connect_binary_password_accepted)
 {
@@ -6705,6 +6859,7 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(decode_connack_v311_exact_remain_len_accepted);
 #ifdef WOLFMQTT_V5
     RUN_TEST(decode_connack_v5_longer_remain_len_accepted);
+    RUN_TEST(decode_connack_v5_shape_without_protocol_level_rejected);
     RUN_TEST(decode_connack_v5_props_cannot_cross_packet_end);
     RUN_TEST(decode_connack_v5_rejects_bytes_after_property_block);
 #endif
@@ -6765,6 +6920,14 @@ void run_mqtt_packet_tests(void)
     RUN_TEST(encode_connect_username_and_password);
     RUN_TEST(encode_connect_binary_password_with_len_not_truncated);
     RUN_TEST(encode_connect_password_len_zero_uses_strlen);
+#ifdef WOLFMQTT_V5
+    RUN_TEST(encode_connect_v5_binary_password_with_len_not_truncated);
+#endif
+    RUN_TEST(encode_connect_password_len_without_password_ignored);
+#ifdef WOLFMQTT_BROKER
+    RUN_TEST(decode_connect_reports_password_len);
+    RUN_TEST(decode_connect_without_password_clears_password_len);
+#endif
     RUN_TEST(encode_connect_binary_password_accepted);
     RUN_TEST(encode_connect_invalid_utf8_clientid_rejected);
     RUN_TEST(encode_connect_invalid_utf8_username_rejected);
