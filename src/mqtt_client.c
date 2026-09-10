@@ -500,27 +500,48 @@ static void MqttClient_RecvQuotaRelease(MqttClient* client, MqttMsgStat* stat)
 }
 #endif /* WOLFMQTT_V5 */
 
-#ifdef WOLFMQTT_SESSION_ID_HASH
-/* Fingerprint the ClientId so the Session state can tell whether a resumed
- * Session belongs to the same one. A collision leaves stale entries in
- * place, which is exactly the behaviour before this check existed, so the
- * cheap hash only ever improves on it. Never returns 0; that value marks
- * "no Session recorded". */
-static word32 MqttClient_ClientIdHash(const char* client_id)
+#ifdef WOLFMQTT_SESSION_ID_TRACK
+/* Does client_id name the Session whose state this client is holding? An
+ * exact comparison: the ClientId identifies the Session [MQTT-3.1.3-2], and a
+ * digest of it would let two different ClientIds that happen to share one
+ * inherit each other's replay entries and QoS 2 pending ids. Returns 0 when no
+ * Session is recorded, so a first connect never matches. */
+static int MqttClient_SessionIdMatches(const MqttClient* client,
+    const char* client_id)
 {
-    word32 hash = 2166136261U; /* FNV-1a 32-bit offset basis */
-    const byte* p;
+    size_t len;
 
-    if (client_id == NULL) {
-        return 1;
+    if (client->session_client_id_len == 0 || client_id == NULL) {
+        return 0;
     }
-    for (p = (const byte*)client_id; *p != '\0'; p++) {
-        hash ^= (word32)*p;
-        hash *= 16777619U; /* FNV-1a 32-bit prime */
+    len = XSTRLEN(client_id);
+    if (len != (size_t)client->session_client_id_len) {
+        return 0;
     }
-    return (hash == 0) ? 1 : hash;
+    return (XMEMCMP(client->session_client_id, client_id, len) == 0) ? 1 : 0;
 }
-#endif /* WOLFMQTT_SESSION_ID_HASH */
+
+/* Record client_id as the Session this client now holds state for. A ClientId
+ * too long for the buffer is not recorded, so the next Session Present is
+ * treated as a different Session and the state is dropped rather than
+ * inherited on a partial match. */
+static void MqttClient_SessionIdRecord(MqttClient* client,
+    const char* client_id)
+{
+    size_t len;
+
+    client->session_client_id_len = 0;
+    if (client_id == NULL) {
+        return;
+    }
+    len = XSTRLEN(client_id);
+    if (len == 0 || len > (size_t)MQTT_MAX_SESSION_CLIENT_ID) {
+        return;
+    }
+    XMEMCPY(client->session_client_id, client_id, len);
+    client->session_client_id_len = (word16)len;
+}
+#endif /* WOLFMQTT_SESSION_ID_TRACK */
 
 #if WOLFMQTT_MAX_QOS >= 2
 /* Inbound QoS 2 de-duplication. A subscribing client that has delivered a
@@ -601,13 +622,19 @@ static MqttReplayMsg* MqttClient_Replay_Find(MqttClient* client,
     return NULL;
 }
 
+/* The retained copies hold application data - a payload may carry credentials
+ * or key material - so they are wiped before going back to the allocator, the
+ * same way the client scrubs tx_buf and rx_buf. The static-memory build has no
+ * separate buffers; the XMEMSET below covers its in-struct copies. */
 static void MqttClient_Replay_FreeSlot(MqttReplayMsg* slot)
 {
 #ifndef WOLFMQTT_STATIC_MEMORY
     if (slot->topic != NULL) {
+        CLIENT_FORCE_ZERO(slot->topic, XSTRLEN(slot->topic) + 1);
         WOLFMQTT_FREE(slot->topic);
     }
     if (slot->payload != NULL) {
+        CLIENT_FORCE_ZERO(slot->payload, slot->payload_len);
         WOLFMQTT_FREE(slot->payload);
     }
 #endif
@@ -682,6 +709,7 @@ static void MqttClient_Replay_Add(MqttClient* client, MqttPublish* publish)
     if (publish->total_len > 0) {
         slot->payload = (byte*)WOLFMQTT_MALLOC(publish->total_len);
         if (slot->payload == NULL) {
+            CLIENT_FORCE_ZERO(slot->topic, topic_len + 1);
             WOLFMQTT_FREE(slot->topic);
             slot->topic = NULL;
             return;
@@ -942,6 +970,34 @@ static void MqttClient_SendIdReleaseOwner(MqttClient* client, const void* owner)
             client->send_inflight[i].owner = NULL;
             client->send_inflight[i].ack_type =
                 (byte)MQTT_PACKET_TYPE_RESERVED;
+        }
+    }
+#ifdef WOLFMQTT_MULTITHREAD
+    wm_SemUnlock(&client->lockClient);
+#endif
+}
+
+/* Detach owner from its reservation without releasing the Packet Identifier.
+ * Used when a message object is being reset for reuse but its packet is
+ * already on the wire: the identifier stays claimed until the peer's
+ * acknowledgement [MQTT-2.3.1-3], while the object must stop owning it so a
+ * later cancel through the reused object cannot give the old one back. */
+static void MqttClient_SendIdDisown(MqttClient* client, const void* owner)
+{
+    int i;
+
+    if (owner == NULL) {
+        return;
+    }
+#ifdef WOLFMQTT_MULTITHREAD
+    if (wm_SemLock(&client->lockClient) != MQTT_CODE_SUCCESS) {
+        return;
+    }
+#endif
+    for (i = 0; i < MQTT_MAX_SEND_INFLIGHT; i++) {
+        if (client->send_inflight[i].packet_id != 0 &&
+                client->send_inflight[i].owner == owner) {
+            client->send_inflight[i].owner = NULL;
         }
     }
 #ifdef WOLFMQTT_MULTITHREAD
@@ -2958,6 +3014,10 @@ static int MqttClient_CheckConnectSent(MqttClient *client)
     if ((flags & MQTT_CLIENT_FLAG_CONNECT_SENT) == 0) {
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
     }
+    /* [MQTT-3.14.4-1] Nothing may follow a DISCONNECT on this connection. */
+    if ((flags & MQTT_CLIENT_FLAG_DISCONNECT_SENT) != 0) {
+        return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_STAT);
+    }
     return MQTT_CODE_SUCCESS;
 }
 
@@ -2994,7 +3054,7 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
 {
     int rc;
     word32 connect_flags = 0;
-#ifdef WOLFMQTT_SESSION_ID_HASH
+#ifdef WOLFMQTT_SESSION_ID_TRACK
     int session_id_matched = 0;
 #endif
 #if defined(WOLFMQTT_V5) && WOLFMQTT_MAX_QOS >= 2
@@ -3418,16 +3478,15 @@ int MqttClient_Connect(MqttClient *client, MqttConnect *mc_connect)
         rc = MQTT_TRACE_ERROR(MQTT_CODE_ERROR_SERVER_PROP);
     }
 
-#ifdef WOLFMQTT_SESSION_ID_HASH
+#ifdef WOLFMQTT_SESSION_ID_TRACK
     /* [MQTT-3.1.3-2] The ClientId identifies the Client and its Session, so
      * session state carries over only when the ClientId is the same one that
-     * created it. Recorded here, before the per-table decisions below, because
-     * the stored hash is updated as part of them. */
+     * created it. Compared here, before the per-table decisions below, because
+     * the recorded ClientId is updated as part of them. */
     if (rc == MQTT_CODE_SUCCESS) {
-        word32 id_hash = MqttClient_ClientIdHash(mc_connect->client_id);
-
-        session_id_matched = (id_hash == client->session_client_id_hash);
-        client->session_client_id_hash = id_hash;
+        session_id_matched =
+            MqttClient_SessionIdMatches(client, mc_connect->client_id);
+        MqttClient_SessionIdRecord(client, mc_connect->client_id);
     }
 #endif
 
@@ -4769,9 +4828,11 @@ int MqttClient_Disconnect_ex(MqttClient *client, MqttDisconnect *p_disconnect)
         rc = MQTT_CODE_SUCCESS;
         /* [MQTT-3.14.4-1] "After sending a DISCONNECT Packet the Client MUST
          * NOT send any more Control Packets on that Network Connection."
-         * Clearing the handshake flag makes the send APIs refuse them, the
-         * same way they do before CONNECT [MQTT-3.1.0-1]. */
-        (void)MqttClient_Flags(client, MQTT_CLIENT_FLAG_CONNECT_SENT, 0);
+         * Recorded separately from MQTT_CLIENT_FLAG_CONNECT_SENT: this call
+         * does not close the transport, so clearing CONNECT_SENT would reopen
+         * the [MQTT-3.1.0-2] duplicate-CONNECT guard and allow a second
+         * CONNECT on the still-open Network Connection. */
+        (void)MqttClient_Flags(client, 0, MQTT_CLIENT_FLAG_DISCONNECT_SENT);
     }
 
 #if defined(WOLFMQTT_DISCONNECT_CB) && defined(WOLFMQTT_USE_CB_ON_DISCONNECT)
@@ -5117,6 +5178,7 @@ int MqttClient_CancelMessage(MqttClient *client, MqttObject* msg)
 {
     int rc = MQTT_CODE_SUCCESS;
     MqttMsgStat* mms_stat;
+    int onWire;
 #ifdef WOLFMQTT_MULTITHREAD
     MqttPendResp* tmpResp;
 #endif
@@ -5132,17 +5194,29 @@ int MqttClient_CancelMessage(MqttClient *client, MqttObject* msg)
     PRINTF("Cancel Msg: %p", msg);
 #endif
 
+    /* Whether this message's packet finished going out. MQTT_MSG_WAIT is only
+     * reached once the whole Control Packet has been written. */
+    onWire = (mms_stat->write == MQTT_MSG_WAIT) ? 1 : 0;
+
     /* reset states */
     mms_stat->write = MQTT_MSG_BEGIN;
     mms_stat->read = MQTT_MSG_BEGIN;
 
-    /* Give back any outbound Packet Identifier this object reserved. Cancel is
-     * the application saying it is done with the exchange and is reusing the
-     * object, so the identifier must not stay claimed for the rest of the
-     * connection - unlike the Receive Maximum unit below, a reused identifier
-     * is the application's own call rather than a flow-control promise made to
-     * the server. */
-    MqttClient_SendIdReleaseOwner(client, msg);
+    /* A packet that never fully reached the transport carries no identifier
+     * the peer can act on, so cancelling it gives the identifier straight
+     * back. One that did is a different matter: the peer may still process it
+     * and answer, and that acknowledgement would complete whatever new
+     * exchange had taken the identifier over. [MQTT-2.3.1-3] makes it reusable
+     * only once the acknowledgement is processed, so the reservation outlives
+     * the cancel - the same reasoning as the Receive Maximum unit below - and
+     * only the object's ownership of it is dropped. The partial-write paths in
+     * MqttPublishMsg re-reserve explicitly after cancelling. */
+    if (onWire) {
+        MqttClient_SendIdDisown(client, msg);
+    }
+    else {
+        MqttClient_SendIdReleaseOwner(client, msg);
+    }
 
     /* Do not credit the reserved Receive Maximum unit here. Cancelling an
      * abandoned QoS>0 publish that already reached the wire must retain the

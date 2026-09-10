@@ -171,7 +171,16 @@ enum MqttClientFlags {
      * Managed by the library - set by MqttClient_Connect and cleared by
      * MqttSocket_Connect and MqttSocket_Disconnect. Applications must not set
      * or clear it through MqttClient_Flags. */
-    MQTT_CLIENT_FLAG_CONNECT_SENT = 0x01 << 5
+    MQTT_CLIENT_FLAG_CONNECT_SENT = 0x01 << 5,
+    /* A DISCONNECT has been written on the current Network Connection.
+     * [MQTT-3.14.4-1] forbids any further Control Packet on it, so the send
+     * APIs refuse one. Kept separate from MQTT_CLIENT_FLAG_CONNECT_SENT
+     * because MqttClient_Disconnect does not close the transport: clearing
+     * CONNECT_SENT instead would reopen the [MQTT-3.1.0-2] duplicate-CONNECT
+     * guard and let a second CONNECT go out on the same Network Connection.
+     * Managed by the library - set by MqttClient_Disconnect_ex and cleared by
+     * MqttSocket_Connect and MqttSocket_Disconnect. */
+    MQTT_CLIENT_FLAG_DISCONNECT_SENT = 0x01 << 6
 };
 /*! \brief      Sets flags in the MqttClient structure. To be used from
                 the application before calling MqttClient_NetConnect.
@@ -325,7 +334,23 @@ typedef struct _MqttReplayMsg {
  * a fingerprint of it to tell a resumed Session from a different one, so the
  * fingerprint exists whenever either of them does. */
 #if (WOLFMQTT_MAX_QOS >= 2) || !defined(WOLFMQTT_NO_SESSION_REPLAY)
-    #define WOLFMQTT_SESSION_ID_HASH
+    #define WOLFMQTT_SESSION_ID_TRACK
+    /* Bytes of the ClientId retained for that comparison. It is an exact
+     * match, not a digest: a digest of this state is attacker-relevant when
+     * the ClientId derives from untrusted input (a per-tenant or per-device
+     * name), because finding two inputs with the same short digest is cheap
+     * and would let one identity's Session state be replayed into another's.
+     * A ClientId longer than this is simply not recorded, so the next Session
+     * Present is treated as a different Session and the state is dropped -
+     * safe, at the cost of no replay for such Clients. Raise it in
+     * user_settings.h if longer ClientIds need Session replay. MQTT 3.1.1
+     * section 3.1.3.1 requires Servers to accept at least 23 bytes. */
+    #ifndef MQTT_MAX_SESSION_CLIENT_ID
+        #define MQTT_MAX_SESSION_CLIENT_ID 64
+    #endif
+    #if (MQTT_MAX_SESSION_CLIENT_ID < 23)
+        #error "MQTT_MAX_SESSION_CLIENT_ID must be at least 23"
+    #endif
 #endif
 
 /* One outbound Packet Identifier reservation. packet_id 0 marks a free slot;
@@ -443,12 +468,13 @@ typedef struct _MqttClient {
      * is empty; a QoS 2 packet id is never 0. */
     word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
 #endif
-#ifdef WOLFMQTT_SESSION_ID_HASH
-    /* Fingerprint of the ClientId whose Session state this client holds - the
-     * inbound QoS 2 pending ids and the outbound replay pool. A Session
-     * Present answer for a different ClientId is a different Session and must
-     * not inherit either [MQTT-3.1.3-2]. 0 means no Session recorded. */
-    word32 session_client_id_hash;
+#ifdef WOLFMQTT_SESSION_ID_TRACK
+    /* The ClientId whose Session state this client holds - the inbound QoS 2
+     * pending ids and the outbound replay pool. A Session Present answer for a
+     * different ClientId is a different Session and must not inherit either
+     * [MQTT-3.1.3-2]. Length 0 means no Session is recorded. */
+    char   session_client_id[MQTT_MAX_SESSION_CLIENT_ID];
+    word16 session_client_id_len;
 #endif
 
     /* Outbound Packet Identifiers written on the current Network Connection

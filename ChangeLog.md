@@ -142,6 +142,27 @@
       completing its own read could previously overwrite it between the read
       lock being dropped and the send lock being taken, sending the later
       Packet Identifier twice and never the earlier one [MQTT-4.6.0-2] (#608)
+    - Session state is keyed on the ClientId itself rather than a 32-bit hash
+      of it. Two different ClientIds sharing a hash would have let one
+      identity's replay entries and QoS 2 pending ids be treated as the
+      other's, which matters when the ClientId derives from untrusted input.
+      A ClientId longer than `MQTT_MAX_SESSION_CLIENT_ID` (64 by default) is
+      not recorded, so its Session state is dropped rather than partially
+      matched [MQTT-3.1.3-2]
+    - `MqttClient_Disconnect` no longer clears the CONNECT-sent flag. It
+      writes the DISCONNECT packet but does not close the transport, so
+      clearing that flag reopened the duplicate-CONNECT guard and allowed a
+      second CONNECT on the same Network Connection [MQTT-3.1.0-2]. A separate
+      flag now refuses further packets after DISCONNECT [MQTT-3.14.4-1]
+    - `MqttClient_CancelMessage` keeps the Packet Identifier of a packet that
+      already reached the wire. The peer can still answer it, and that
+      acknowledgement would otherwise complete whatever new exchange had taken
+      the identifier over; [MQTT-2.3.1-3] makes it reusable only once the
+      acknowledgement is processed. A packet that never fully went out still
+      releases its identifier immediately
+    - Retained replay copies of topics and payloads are zeroized before being
+      freed, so application data - which may include credentials - is not left
+      in reusable heap
     - Outbound Session state is now bound to the ClientId that created it, so
       a client object reused under a new ClientId no longer replays the
       previous Session's messages into the new one when the server answers

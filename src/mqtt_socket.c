@@ -413,7 +413,9 @@ int MqttSocket_Connect(MqttClient *client, const char* host, word16 port,
          * on connect as well as on disconnect keeps the handshake state
          * correct for an application that reconnects without routing through
          * MqttClient_NetDisconnect. */
-        MqttClient_Flags(client, MQTT_CLIENT_FLAG_CONNECT_SENT,
+        MqttClient_Flags(client,
+            (MQTT_CLIENT_FLAG_CONNECT_SENT |
+             MQTT_CLIENT_FLAG_DISCONNECT_SENT),
             MQTT_CLIENT_FLAG_IS_CONNECTED);
     }
 
@@ -590,7 +592,8 @@ int MqttSocket_Disconnect(MqttClient *client)
         /* The MQTT handshake belongs to the Network Connection being closed;
          * the next one must start with its own CONNECT [MQTT-3.1.0-1]. */
         MqttClient_Flags(client,
-            (MQTT_CLIENT_FLAG_IS_CONNECTED | MQTT_CLIENT_FLAG_CONNECT_SENT), 0);
+            (MQTT_CLIENT_FLAG_IS_CONNECTED | MQTT_CLIENT_FLAG_CONNECT_SENT |
+             MQTT_CLIENT_FLAG_DISCONNECT_SENT), 0);
 
     #ifdef ENABLE_MQTT_CURL
         if (client->curl_initialized) {
